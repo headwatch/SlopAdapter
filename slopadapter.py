@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import os
+import io
 import time
 import asyncio
 import aiosqlite
@@ -13,7 +14,7 @@ import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
 # =====================================================================
-# 1. GLOBAL CONFIGURATION & PERMISSION MATRIX
+# 1. CONFIGURATION & PERMISSIONS
 # =====================================================================
 
 BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
@@ -21,10 +22,7 @@ PROXY_URL = None
 
 GUILD_ID = 0
 
-POLLS_CHANNEL_IDS: List[int] = [
-    # 123456789012345679,
-    # 123456789012345685,
-]
+POLLS_CHANNEL_IDS: List[int] = []
 
 ELECTIONS_CHANNEL_ID = 0
 APPEALS_CHANNEL_ID = 0
@@ -33,12 +31,10 @@ MOD_LOG_CHANNEL_ID = 0
 MEMBER_ROLE_ID = 0
 ISOLATION_ROLE_ID = 0
 
-MANAGER_ROLES: Dict[int, str] = {
-    # 111111111111111111: "Модератор",
-    # 222222222222222222: "Администратор",
-    # 333333333333333333: "Главный Администратор"
-}
+# Map of role_id -> role_title for authorized staff roles
+MANAGER_ROLES: Dict[int, str] = {}
 
+# Role IDs permitted to execute specific privileged commands
 COMMAND_PERMISSIONS: Dict[str, List[int]] = {
     "rreject":      [],
     "rconfirm":     [],
@@ -56,7 +52,7 @@ DAILY_ACTION_LIMIT = 3
 DAILY_LIMIT_WINDOW = 86400
 
 # =====================================================================
-# 2. SVA V. RH & ACI STANDARD PARAMETERS
+# 2. SVA V. RH TIERS & CATEGORIES
 # =====================================================================
 
 TIERS: Dict[str, Dict[str, int]] = {
@@ -96,7 +92,7 @@ SNOWFLAKE_RE = re.compile(r"\d{15,22}")
 DISCORD_MAX_TIMEOUT_SECONDS = 2419200
 
 # =====================================================================
-# 3. STORAGE, CACHE, DATABASE & BOT INITIALIZATION
+# 3. STATE, CACHES & PERSISTENCE
 # =====================================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +108,7 @@ for directory in [POLLS_DIR, ARCHIVE_DIR, ELECTIONS_DIR, STATE_DIR]:
 
 file_lock = asyncio.Lock()
 POLLS_CACHE: Dict[str, Dict[str, Any]] = {}
+ARCHIVE_CACHE: Dict[str, Dict[str, Any]] = {}
 DASHBOARD_CACHE: Optional[Dict[str, Any]] = None
 
 MESSAGE_LOG_BUFFER: List[Tuple[int, int, float]] = []
@@ -129,16 +126,44 @@ bot.remove_command("help")
 
 
 def write_json_atomic(filepath: str, data: Dict[str, Any]) -> None:
-    """Atomically writes JSON data via a temporary file."""
+    """Writes JSON via a temporary file to prevent corruption on crash."""
     tmp_path = f"{filepath}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     os.replace(tmp_path, filepath)
 
 
+def archive_poll_data(poll_id: str, data: Dict[str, Any]) -> None:
+    """Moves completed or permanently rejected poll from active storage to archive."""
+    poll_id_str = str(poll_id)
+    active_path = os.path.join(POLLS_DIR, f"{poll_id_str}.json")
+    archive_path = os.path.join(ARCHIVE_DIR, f"{poll_id_str}.json")
+    write_json_atomic(archive_path, data)
+    if os.path.exists(active_path):
+        try:
+            os.remove(active_path)
+        except Exception:
+            pass
+    POLLS_CACHE.pop(poll_id_str, None)
+    ARCHIVE_CACHE[poll_id_str] = data
+
+
 def load_polls_into_cache() -> None:
-    """Loads all active poll JSON files from disk into memory."""
+    """Loads active and archived polls from disk; auto-archives terminal polls."""
     POLLS_CACHE.clear()
+    ARCHIVE_CACHE.clear()
+
+    for fname in os.listdir(ARCHIVE_DIR):
+        if not fname.endswith(".json"):
+            continue
+        poll_id = fname[:-5]
+        fpath = os.path.join(ARCHIVE_DIR, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                ARCHIVE_CACHE[poll_id] = json.load(f)
+        except Exception as e:
+            print(f"[Archive Load Error on {fname}]: {e}")
+
     for fname in os.listdir(POLLS_DIR):
         if not fname.endswith(".json"):
             continue
@@ -146,13 +171,17 @@ def load_polls_into_cache() -> None:
         fpath = os.path.join(POLLS_DIR, fname)
         try:
             with open(fpath, "r", encoding="utf-8") as f:
-                POLLS_CACHE[poll_id] = json.load(f)
+                data = json.load(f)
+            if data.get("status") in ("finished", "rejected_final"):
+                archive_poll_data(poll_id, data)
+            else:
+                POLLS_CACHE[poll_id] = data
         except Exception as e:
             print(f"[Cache Load Error on {fname}]: {e}")
 
 
 def get_poll_data(poll_id: str, include_archive: bool = False) -> Optional[Dict[str, Any]]:
-    """Retrieves poll data from memory cache, disk, or archive."""
+    """Fetches poll state from active cache/disk, optionally falling back to archive."""
     if poll_id in POLLS_CACHE:
         return POLLS_CACHE[poll_id]
 
@@ -167,25 +196,33 @@ def get_poll_data(poll_id: str, include_archive: bool = False) -> Optional[Dict[
             return None
 
     if include_archive:
+        if poll_id in ARCHIVE_CACHE:
+            return ARCHIVE_CACHE[poll_id]
         archive_path = os.path.join(ARCHIVE_DIR, f"{poll_id}.json")
         if os.path.exists(archive_path):
             try:
                 with open(archive_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                ARCHIVE_CACHE[poll_id] = data
+                return data
             except Exception:
                 return None
     return None
 
 
 def save_poll_data(poll_id: str, data: Dict[str, Any]) -> None:
-    """Updates poll data in memory cache and persists it to disk."""
-    POLLS_CACHE[str(poll_id)] = data
-    filepath = os.path.join(POLLS_DIR, f"{poll_id}.json")
-    write_json_atomic(filepath, data)
+    """Saves active poll or routes terminal poll directly to archive."""
+    poll_id_str = str(poll_id)
+    if data.get("status") in ("finished", "rejected_final"):
+        archive_poll_data(poll_id_str, data)
+    else:
+        POLLS_CACHE[poll_id_str] = data
+        filepath = os.path.join(POLLS_DIR, f"{poll_id_str}.json")
+        write_json_atomic(filepath, data)
 
 
 def ensure_sample_election_template() -> None:
-    """Generates a commented-out sample election template if missing."""
+    """Creates a reference questionnaire JSON template if none exists."""
     sample_path = os.path.join(ELECTIONS_DIR, "example.json")
     if not os.path.exists(sample_path):
         commented_template = (
@@ -224,7 +261,7 @@ def ensure_sample_election_template() -> None:
 
 
 async def setup_db() -> None:
-    """Initializes SQLite schema and indices."""
+    """Initializes SQLite tables in WAL mode for activity, isolations, and rate limits."""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
@@ -272,7 +309,7 @@ async def setup_db() -> None:
 
 
 async def flush_message_logs() -> None:
-    """Flushes buffered message activity metadata to SQLite."""
+    """Persists in-memory message timestamp buffer to SQLite."""
     global MESSAGE_LOG_BUFFER
     async with buffer_lock:
         if not MESSAGE_LOG_BUFFER:
@@ -292,7 +329,7 @@ async def flush_message_logs() -> None:
 
 
 # =====================================================================
-# 4. PERMISSIONS, CHANNELS, LIMITS & QUORUM UTILITIES
+# 4. VALIDATION, PERMISSIONS & QUORUM HELPERS
 # =====================================================================
 
 def resolve_poll_destination_channel(
@@ -301,7 +338,7 @@ def resolve_poll_destination_channel(
     explicit_channel_id: Optional[int] = None,
     requested_poll_channel: Optional[discord.TextChannel] = None
 ) -> Tuple[Optional[discord.abc.Messageable], Optional[str]]:
-    """Resolves and validates the target guild channel for poll publication."""
+    """Determines and validates the target channel for publishing a poll."""
     if explicit_channel_id and explicit_channel_id > 0:
         ch = guild.get_channel(explicit_channel_id)
         if ch:
@@ -343,8 +380,44 @@ def resolve_poll_destination_channel(
     return None, "❌ На сервере не найден подходящий текстовый канал для публикации голосования."
 
 
+def is_manager_related_poll(
+    guild: discord.Guild,
+    category: str,
+    content: str,
+    target_user_id: Optional[int] = None,
+    target_role_id: Optional[int] = None
+) -> bool:
+    """Checks if a poll evaluates or restricts Managers to grant Rule 0.2 protection (Rule 4.5)."""
+    if target_role_id and target_role_id in MANAGER_ROLES:
+        return True
+
+    if target_user_id:
+        member = guild.get_member(target_user_id)
+        if member and any(r.id in MANAGER_ROLES for r in member.roles):
+            return True
+
+    if category not in ("Правосудие", "Стафф"):
+        return False
+
+    extracted_ids = {int(x) for x in SNOWFLAKE_RE.findall(content)}
+    for sid in extracted_ids:
+        if sid in MANAGER_ROLES:
+            return True
+        member = guild.get_member(sid)
+        if member and any(r.id in MANAGER_ROLES for r in member.roles):
+            return True
+
+    lowered = content.lower()
+    manager_keywords = ["управлен", "модератор", "админ", "п. 4.", "п. 3.5", "импичмент", "сняти", "должност"]
+    for role_title in MANAGER_ROLES.values():
+        if role_title.lower() in lowered:
+            return True
+
+    return any(kw in lowered for kw in manager_keywords)
+
+
 async def check_daily_command_limit(user_id: int, guild_id: int, command_name: str) -> Tuple[bool, int, int]:
-    """Checks 24-hour rate limit for privileged commands. Returns (allowed, used_count, reset_ts)."""
+    """Enforces 24h rolling window rate limit for sensitive staff commands."""
     now = int(time.time())
     window_start = now - DAILY_LIMIT_WINDOW
     async with aiosqlite.connect(DB_FILE) as db:
@@ -365,7 +438,7 @@ async def check_daily_command_limit(user_id: int, guild_id: int, command_name: s
 
 
 async def record_command_usage(user_id: int, guild_id: int, command_name: str) -> None:
-    """Logs execution of a rate-limited command."""
+    """Records execution timestamp for rate-limited command."""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "INSERT INTO command_usage_logs (user_id, guild_id, command_name, timestamp) VALUES (?, ?, ?, ?)",
@@ -375,7 +448,7 @@ async def record_command_usage(user_id: int, guild_id: int, command_name: str) -
 
 
 def parse_isolation_duration(duration_str: str) -> Optional[int]:
-    """Parses duration tokens (Ns, Nh, Nd, Nm, Ny) into seconds. Returns 0 for indefinite, None if invalid."""
+    """Converts duration string (e.g., '1d 12h', '0') into seconds; None if malformed."""
     cleaned = duration_str.strip().lower()
     if not cleaned or cleaned == "0":
         return 0
@@ -392,7 +465,7 @@ def parse_isolation_duration(duration_str: str) -> Optional[int]:
 
 
 def format_duration_human(seconds: int) -> str:
-    """Formats seconds into a human-readable duration string."""
+    """Formats seconds into a localized readable duration string."""
     if seconds <= 0:
         return "До окончания публичного разбирательства / апелляции"
     parts = []
@@ -404,7 +477,7 @@ def format_duration_human(seconds: int) -> str:
 
 
 def has_command_permission(member: discord.Member, command_key: str) -> bool:
-    """Verifies whether the member holds an authorized role for command_key."""
+    """Checks if member has any role listed in COMMAND_PERMISSIONS[command_key]."""
     allowed_roles = set(COMMAND_PERMISSIONS.get(command_key, ()))
     if not allowed_roles:
         return False
@@ -412,7 +485,7 @@ def has_command_permission(member: discord.Member, command_key: str) -> bool:
 
 
 def check_full_member_status(member: discord.Member) -> Tuple[bool, str]:
-    """Verifies full member status and absence of isolation restrictions."""
+    """Verifies member holds Full Member role and is not under Isolation (Rules 0.3, 3.5)."""
     user_role_ids = {r.id for r in member.roles}
     if ISOLATION_ROLE_ID > 0 and ISOLATION_ROLE_ID in user_role_ids:
         return False, "❌ Вы находитесь в статусе **Ограниченного участника (Изоляция, п. 3.5)**. Ваше право на участие в голосованиях приостановлено (Раздел 5). Для оспаривания используйте `/rappeal` в ЛС бота."
@@ -424,7 +497,7 @@ def check_full_member_status(member: discord.Member) -> Tuple[bool, str]:
 
 
 async def get_active_users_stats(guild_id: int) -> Tuple[int, float, List[Tuple[int, int]]]:
-    """Calculates 30-day activity median and active user count for dynamic quorum."""
+    """Computes 30-day message median and active user count for dynamic quorum (Rule 6.7)."""
     await flush_message_logs()
     now = time.time()
 
@@ -465,7 +538,7 @@ async def get_active_users_stats(guild_id: int) -> Tuple[int, float, List[Tuple[
 
 
 async def log_moderation_action(guild: discord.Guild, embed: discord.Embed) -> None:
-    """Sends a moderation audit embed to MOD_LOG_CHANNEL_ID."""
+    """Sends audit embed to MOD_LOG_CHANNEL_ID if configured."""
     if not MOD_LOG_CHANNEL_ID or MOD_LOG_CHANNEL_ID <= 0:
         return
     channel = guild.get_channel(MOD_LOG_CHANNEL_ID)
@@ -480,12 +553,17 @@ async def log_moderation_action(guild: discord.Guild, embed: discord.Embed) -> N
         print(f"[ModLog Error]: {e}")
 
 
+# =====================================================================
+# 5. POLL EMBED & INTERACTIVE UI COMPONENTS
+# =====================================================================
+
 def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
-    """Constructs the poll status embed."""
+    """Renders poll embed including status, thresholds, ACI shields, and complaint counter."""
     status = data.get("status", "active")
     poll_type = data.get("poll_type", "standard")
     poll_id = data.get("poll_message_id", "ID_ГОЛОСОВАНИЯ")
     voters_count = len(data.get("votes", {}))
+    reports_count = len(data.get("aci_reports", []))
 
     if status == "cooldown":
         title_prefix = "🧊 [Охлаждение]"
@@ -517,7 +595,7 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
         for line in data.get("quote_content", "").split("\n")
     )
     if len(formatted_quote) > 2400:
-        formatted_quote = formatted_quote[:2400] + "\n> *...[текст сокращён]*"
+        formatted_quote = formatted_quote[:2400] + "\n> *...[полный неизменяемый текст прикреплён в файле ниже (п. 6.4.1)]*"
 
     desc_blocks = []
 
@@ -528,8 +606,13 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
             "┗ **Рекомендуется воздержаться (`⏺️`) или голосовать против (`🔽`/`⏬`), если Управленец не нарушал Стандарт ACI (п. 4.5, 6.2) или п. 0.2 Регламента.**"
         )
 
+    source_link_str = ""
+    if data.get("target_message_id") and data.get("source_channel_id") and data.get("guild_id"):
+        src_url = f"https://discord.com/channels/{data['guild_id']}/{data['source_channel_id']}/{data['target_message_id']}"
+        source_link_str = f" • [Оригинал]({src_url})"
+
     desc_blocks.append(
-        f"### Повестка (Автор: **{data.get('target_author_name', 'Участник')}**)\n"
+        f"### Повестка (Автор: **{data.get('target_author_name', 'Участник')}**{source_link_str})\n"
         f"{formatted_quote}"
     )
 
@@ -589,7 +672,11 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
         aci_text = None
 
     if aci_text:
-        embed.add_field(name="🛡️ Статус ACI", value=aci_text, inline=False)
+        aci_field_value = f"┏ {aci_text}\n┗ ⚠️Жалобы: `{reports_count} шт.`"
+    else:
+        aci_field_value = f"⚠️Жалобы: `{reports_count} шт.`"
+
+    embed.add_field(name="🛡️ Статус ACI", value=aci_field_value, inline=False)
 
     if status == "cooldown":
         timer_block = (
@@ -623,7 +710,7 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
 
 
 async def sync_poll_message_ui(data: Dict[str, Any]) -> None:
-    """Synchronizes the Discord message embed and view with current poll state."""
+    """Refreshes the Discord message embed and button states for a poll."""
     channel = bot.get_channel(data["channel_id"])
     if not channel:
         try:
@@ -637,12 +724,8 @@ async def sync_poll_message_ui(data: Dict[str, Any]) -> None:
         pass
 
 
-# =====================================================================
-# 5. INTERACTIVE UI VIEWS & MODALS
-# =====================================================================
-
 class ACIReportModal(discord.ui.Modal, title="Запрос на проверку Стандарта ACI"):
-    """Modal for submitting an ACI compliance report."""
+    """Modal for submitting a single ACI violation report per user per poll."""
     def __init__(self, poll_id: str, poll_url: str):
         super().__init__()
         self.poll_id = poll_id
@@ -660,11 +743,42 @@ class ACIReportModal(discord.ui.Modal, title="Запрос на проверку
         if not interaction.guild:
             return await interaction.response.send_message("❌ Доступно только на сервере.", ephemeral=True)
 
+        async with file_lock:
+            data = get_poll_data(self.poll_id)
+            if not data or data.get("status") in ("finished", "rejected_final", "rejected_frozen"):
+                return await interaction.response.send_message("❌ Голосование уже завершено или заморожено.", ephemeral=True)
+
+            if data.get("immune_to_aci") or data.get("aci_shield"):
+                return await interaction.response.send_message("🛡️ Это голосование защищено от жалоб ACI.", ephemeral=True)
+
+            reports = data.setdefault("aci_reports", [])
+            already_reported = any(
+                (r.get("user_id") == interaction.user.id if isinstance(r, dict) else r == interaction.user.id)
+                for r in reports
+            )
+            if already_reported:
+                return await interaction.response.send_message(
+                    "⚠️ Вы уже отправляли жалобу ACI на это голосование. Повторная отправка не допускается.",
+                    ephemeral=True
+                )
+
+            reports.append({
+                "user_id": interaction.user.id,
+                "username": interaction.user.name,
+                "details": self.violation_details.value,
+                "timestamp": int(time.time())
+            })
+            reports_count = len(reports)
+            save_poll_data(self.poll_id, data)
+
+        await sync_poll_message_ui(data)
+
         report_embed = discord.Embed(
             title="🚩 Запрос на валидацию голосования (Стандарт ACI)",
             description=(
                 f"**Голосование:** [Перейти к сообщению]({self.poll_url}) (ID: `{self.poll_id}`)\n"
-                f"**Заявитель:** {interaction.user.mention} (`{interaction.user.id}`)\n\n"
+                f"**Заявитель:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+                f"**Всего жалоб на опросе:** `{reports_count} шт.`\n\n"
                 f"**Суть несоответствия ACI:**\n> {self.violation_details.value}\n\n"
                 f"🔧 **Действия Управленца (п. 3.3):**\n"
                 f"• Подтвердить и выдать щит: `/rconfirm poll_id:{self.poll_id}`\n"
@@ -675,13 +789,13 @@ class ACIReportModal(discord.ui.Modal, title="Запрос на проверку
         )
         await log_moderation_action(interaction.guild, report_embed)
         await interaction.response.send_message(
-            "✅ Ваш запрос на проверку соответствия Стандарту ACI передан Управленцам.",
+            f"✅ Ваш запрос на проверку соответствия Стандарту ACI передан Управленцам (всего жалоб: `{reports_count} шт.`).",
             ephemeral=True
         )
 
 
 class PollVotingView(discord.ui.View):
-    """Persistent Likert-scale voting view (+2 to -2, vote check, ACI report)."""
+    """Persistent Likert scale voting buttons (+2 to -2), vote lookup, and ACI report trigger."""
     def __init__(self, poll_data: Optional[Dict[str, Any]] = None):
         super().__init__(timeout=None)
         if poll_data is not None:
@@ -825,15 +939,22 @@ class PollVotingView(discord.ui.View):
                 ephemeral=True
             )
 
+        reports = data.get("aci_reports", [])
+        if any((r.get("user_id") == interaction.user.id if isinstance(r, dict) else r == interaction.user.id) for r in reports):
+            return await interaction.response.send_message(
+                "⚠️ Вы уже отправляли жалобу ACI на это голосование. Повторная отправка не допускается.",
+                ephemeral=True
+            )
+
         await interaction.response.send_modal(ACIReportModal(poll_id, interaction.message.jump_url))
 
 
 # =====================================================================
-# 6. MULTI-STEP ELECTION QUESTIONNAIRE MODALS
+# 6. CANDIDATE QUESTIONNAIRE MODALS (/rpollelection)
 # =====================================================================
 
 class NextQuestionnairePartView(discord.ui.View):
-    """Pagination view for multi-part candidate questionnaires."""
+    """Chains multi-step modals when an election template has >5 questions."""
     def __init__(self, candidate_id: int, template_data: Dict[str, Any], collected_answers: List[Tuple[str, str]], next_index: int):
         super().__init__(timeout=900)
         self.candidate_id = candidate_id
@@ -856,7 +977,7 @@ class NextQuestionnairePartView(discord.ui.View):
 
 
 class ElectionQuestionnaireModal(discord.ui.Modal):
-    """Modal displaying up to 5 role questionnaire prompts per step."""
+    """Collects up to 5 questionnaire answers per modal and launches template election poll."""
     def __init__(self, candidate_id: int, template_data: Dict[str, Any], collected_answers: List[Tuple[str, str]], start_index: int = 0):
         questions = template_data.get("questions", [])
         total_parts = math.ceil(len(questions) / 5)
@@ -951,7 +1072,7 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
 
 
 # =====================================================================
-# 7. POLL LIFECYCLE & AUTOMATED EXECUTION ENGINE
+# 7. POLL CREATION & AUTOMATED EXECUTION ENGINE
 # =====================================================================
 
 async def launch_poll_instance(
@@ -968,6 +1089,7 @@ async def launch_poll_instance(
     duration_sec: int,
     poll_type: str = "standard",
     target_message_id: int = 0,
+    source_channel_id: int = 0,
     target_user_id: Optional[int] = None,
     target_role_id: Optional[int] = None,
     target_role_name: Optional[str] = None,
@@ -976,7 +1098,7 @@ async def launch_poll_instance(
     destination_channel_id: Optional[int] = None,
     requested_poll_channel: Optional[discord.TextChannel] = None
 ) -> Optional[discord.Message]:
-    """Creates, publishes, and persists a new poll instance."""
+    """Creates, sends, and persists a new poll; attaches frozen .txt if proposal exceeds embed limits."""
     channel, _ = resolve_poll_destination_channel(
         guild=guild,
         fallback_channel=fallback_channel,
@@ -994,6 +1116,15 @@ async def launch_poll_instance(
     end_time = start_time + duration_sec
     status = "cooldown" if cooldown_sec > 0 else "active"
 
+    if not protect_from_02:
+        protect_from_02 = is_manager_related_poll(
+            guild=guild,
+            category=category,
+            content=quote_content,
+            target_user_id=target_user_id,
+            target_role_id=target_role_id
+        )
+
     poll_data: Dict[str, Any] = {
         "poll_message_id": 0,
         "guild_id": guild.id,
@@ -1002,6 +1133,7 @@ async def launch_poll_instance(
         "initiator_id": initiator.id,
         "initiator_name": initiator.name,
         "target_message_id": target_message_id,
+        "source_channel_id": source_channel_id,
         "target_author_name": target_author_name,
         "quote_content": quote_content,
         "category": category,
@@ -1018,13 +1150,24 @@ async def launch_poll_instance(
         "immune_to_aci": immune_to_aci,
         "protect_from_02": protect_from_02,
         "aci_shield": False,
+        "aci_reports": [],
         "votes": {}
     }
 
     initial_embed = build_poll_embed(poll_data)
     view = PollVotingView(poll_data)
+
+    # Attach immutable text snapshot if proposal exceeds embed display threshold (Rule 6.4.1)
+    files_to_attach = []
+    if len(quote_content) > 2200:
+        frozen_bytes = quote_content.encode("utf-8")
+        files_to_attach.append(discord.File(io.BytesIO(frozen_bytes), filename=f"frozen_proposal_{now}.txt"))
+
     try:
-        poll_msg = await channel.send(embed=initial_embed, view=view)
+        if files_to_attach:
+            poll_msg = await channel.send(embed=initial_embed, view=view, files=files_to_attach)
+        else:
+            poll_msg = await channel.send(embed=initial_embed, view=view)
     except Exception as e:
         print(f"[Launch Poll Send Error]: {e}")
         return None
@@ -1043,7 +1186,7 @@ async def launch_poll_instance(
 
 
 async def execute_automated_decision(data: Dict[str, Any], guild: discord.Guild) -> str:
-    """Executes automated role/isolation actions upon poll victory (impeach, election, appeal)."""
+    """Executes automated role/isolation changes upon poll victory and logs to MOD_LOG_CHANNEL_ID."""
     poll_type = data.get("poll_type", "standard")
     target_user_id = data.get("target_user_id")
 
@@ -1068,7 +1211,15 @@ async def execute_automated_decision(data: Dict[str, Any], guild: discord.Guild)
                 return "ℹ️ На момент завершения голосования у пользователя уже отсутствовали роли Управленца."
             await member.remove_roles(*roles_to_remove, reason=f"АСУ: Импичмент по итогам голосования #{data['poll_message_id']} (п. 6.8)")
             removed_names = ", ".join(r.name for r in roles_to_remove)
-            return f"⚡ **АСУ исполнено автоматически (п. 6.8):** С пользователя {member.mention} сняты все управленческие роли ({removed_names})."
+            note = f"⚡ **АСУ исполнено автоматически (п. 6.8):** С пользователя {member.mention} сняты все управленческие роли ({removed_names})."
+            log_emb = discord.Embed(
+                title="⚡ Автоисполнение АСУ: Снятие Управленца (п. 6.8)",
+                description=f"**Голосование:** `{data['poll_message_id']}`\n**Пользователь:** {member.mention}\n**Снятые роли:** {removed_names}",
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow()
+            )
+            await log_moderation_action(guild, log_emb)
+            return note
 
         elif poll_type in ("direct_election", "template_election"):
             role_id = data.get("target_role_id")
@@ -1076,7 +1227,15 @@ async def execute_automated_decision(data: Dict[str, Any], guild: discord.Guild)
             if not role:
                 return "⚠️ Автоматическое исполнение не удалось: целевая роль не найдена на сервере."
             await member.add_roles(role, reason=f"АСУ: Избрание по итогам голосования #{data['poll_message_id']} (Раздел 7)")
-            return f"🎖️ **АСУ исполнено автоматически (п. 6.6, Раздел 7):** Пользователю {member.mention} присвоена должность {role.mention}!"
+            note = f"🎖️ **АСУ исполнено автоматически (п. 6.6, Раздел 7):** Пользователю {member.mention} присвоена должность {role.mention}!"
+            log_emb = discord.Embed(
+                title="🎖️ Автоисполнение АСУ: Избрание Управленца (Раздел 7)",
+                description=f"**Голосование:** `{data['poll_message_id']}`\n**Избран:** {member.mention}\n**Должность:** {role.mention}",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            await log_moderation_action(guild, log_emb)
+            return note
 
         elif poll_type == "appeal":
             await restore_user_from_isolation(
@@ -1084,7 +1243,15 @@ async def execute_automated_decision(data: Dict[str, Any], guild: discord.Guild)
                 member,
                 reason=f"АСУ: Автоматическое снятие Изоляции по итогам Публичной апелляции #{data['poll_message_id']} (п. 5.1)"
             )
-            return f"🕊️ **АСУ исполнено автоматически (п. 5.1):** С пользователя {member.mention} снята Изоляция и возвращены все изъятые при изоляции роли и права."
+            note = f"🕊️ **АСУ исполнено автоматически (п. 5.1):** С пользователя {member.mention} снята Изоляция и возвращены все изъятые при изоляции роли и права."
+            log_emb = discord.Embed(
+                title="🕊️ Автоисполнение АСУ: Удовлетворена Публичная апелляция (п. 5.1)",
+                description=f"**Голосование:** `{data['poll_message_id']}`\n**Восстановлен участник:** {member.mention}",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            await log_moderation_action(guild, log_emb)
+            return note
 
     except discord.Forbidden:
         return "⚠️ Ошибка прав Discord: роль бота находится ниже целевой роли в иерархии сервера."
@@ -1095,7 +1262,7 @@ async def execute_automated_decision(data: Dict[str, Any], guild: discord.Guild)
 
 
 async def restore_user_from_isolation(guild: discord.Guild, member: discord.Member, reason: str) -> None:
-    """Removes isolation status, restores saved roles, and clears timeout/voice mute."""
+    """Removes Isolation role, restores saved roles from SQLite, and clears timeouts/mutes."""
     iso_role = guild.get_role(ISOLATION_ROLE_ID) if ISOLATION_ROLE_ID > 0 else None
     mem_role = guild.get_role(MEMBER_ROLE_ID) if MEMBER_ROLE_ID > 0 else None
 
@@ -1145,12 +1312,12 @@ async def restore_user_from_isolation(guild: discord.Guild, member: discord.Memb
 
 
 # =====================================================================
-# 8. BACKGROUND TASKS (POLLS, MAINTENANCE, DASHBOARD)
+# 8. BACKGROUND LOOPS (POLL LIFECYCLE, ISOLATIONS, DASHBOARD)
 # =====================================================================
 
 @tasks.loop(seconds=10)
 async def poll_checker() -> None:
-    """Polls state transitions (cooldown -> active -> finished/rejected) ordered chronologically."""
+    """Processes poll state transitions in chronological order (Rule 6.9.1)."""
     current_time = int(time.time())
     polls_to_finish: List[Tuple[int, str]] = []
 
@@ -1158,6 +1325,8 @@ async def poll_checker() -> None:
         try:
             status = data.get("status", "active")
             if status in ("finished", "rejected_final"):
+                async with file_lock:
+                    archive_poll_data(poll_id, data)
                 continue
 
             if status == "cooldown" and current_time >= data["start_time"]:
@@ -1181,7 +1350,7 @@ async def poll_checker() -> None:
 
 
 async def activate_poll(poll_id: str) -> None:
-    """Transitions a poll from cooldown to active status."""
+    """Transitions poll from cooldown to active voting."""
     async with file_lock:
         data = get_poll_data(poll_id)
         if not data:
@@ -1193,7 +1362,7 @@ async def activate_poll(poll_id: str) -> None:
 
 
 async def finalize_rejected_poll(poll_id: str) -> None:
-    """Marks a frozen rejected poll as permanently rejected after the cross-control window expires."""
+    """Permanently rejects and archives a frozen poll once the cross-control window expires."""
     async with file_lock:
         data = get_poll_data(poll_id)
         if not data:
@@ -1205,7 +1374,7 @@ async def finalize_rejected_poll(poll_id: str) -> None:
 
 
 async def process_poll_results(poll_id: str) -> None:
-    """Calculates final weighted poll results, triggers automated execution, and posts summary."""
+    """Tallies Likert weights, executes automated actions on victory, and archives the poll."""
     data = get_poll_data(poll_id)
     if not data:
         return
@@ -1221,6 +1390,7 @@ async def process_poll_results(poll_id: str) -> None:
 
     valid_votes = list(data.get("votes", {}).values())
     total_voters = len(valid_votes)
+    reports_count = len(data.get("aci_reports", []))
 
     positive_weight = sum(v["weight"] for v in valid_votes if v["weight"] > 0)
     negative_weight = sum(-v["weight"] for v in valid_votes if v["weight"] < 0)
@@ -1282,7 +1452,8 @@ async def process_poll_results(poll_id: str) -> None:
         value=(
             f"┏ **Категория:** `{data['category']}` (Тир: **{data['tier']}**)\n"
             f"┃ **Автор текста:** **{data['target_author_name']}**\n"
-            f"┗ **Инициатор:** <@{data['initiator_id']}>"
+            f"┃ **Инициатор:** <@{data['initiator_id']}>\n"
+            f"┗ ⚠️Жалобы: `{reports_count} шт.`"
         ),
         inline=True
     )
@@ -1322,12 +1493,11 @@ async def process_poll_results(poll_id: str) -> None:
 
 @tasks.loop(seconds=10)
 async def system_maintenance_loop() -> None:
-    """Handles expired isolations, timeout renewals (>28d), log flushing, and delayed appointments."""
+    """Releases expired isolations, renews 28d Discord timeouts, and executes delayed /relection roles."""
     await flush_message_logs()
     now = int(time.time())
     try:
         async with aiosqlite.connect(DB_FILE) as db:
-            # Release expired isolations
             async with db.execute("SELECT user_id, guild_id FROM isolations WHERE end_time > 0 AND end_time <= ?", (now,)) as cursor:
                 expired_isolations = await cursor.fetchall()
 
@@ -1342,11 +1512,17 @@ async def system_maintenance_loop() -> None:
                             member = None
                     if member:
                         await restore_user_from_isolation(guild, member, reason="АСУ: Истёк срок временной Изоляции (п. 5.2)")
+                        log_emb = discord.Embed(
+                            title="🕊️ Автоматическое окончание срока Изоляции (п. 5.2)",
+                            description=f"**Участник:** {member.mention} (`{member.id}`)\n**Основание:** Истёк установленный таймер Изоляции.",
+                            color=discord.Color.green(),
+                            timestamp=discord.utils.utcnow()
+                        )
+                        await log_moderation_action(guild, log_emb)
                     else:
                         await db.execute("DELETE FROM isolations WHERE user_id = ?", (user_id,))
                         await db.commit()
 
-            # Renew Discord timeouts for long/indefinite isolations
             async with db.execute("SELECT user_id, guild_id, end_time, reason FROM isolations WHERE end_time = 0 OR end_time > ?", (now,)) as cursor:
                 active_isolations = await cursor.fetchall()
 
@@ -1372,7 +1548,6 @@ async def system_maintenance_loop() -> None:
                         except Exception:
                             pass
 
-            # Execute pending /relection role appointments
             async with db.execute(
                 "SELECT id, guild_id, target_user_id, role_id, initiator_id, reason FROM pending_appointments WHERE executed = 0 AND execute_at <= ?",
                 (now,)
@@ -1411,7 +1586,7 @@ async def system_maintenance_loop() -> None:
 
 @tasks.loop(seconds=5)
 async def live_dashboard_loop() -> None:
-    """Periodically updates the persistent /rstatistics dashboard message."""
+    """Updates the persistent /rstatistics message at the configured interval."""
     global DASHBOARD_CACHE
     if DASHBOARD_CACHE is None:
         if not os.path.exists(DASHBOARD_STATE_FILE):
@@ -1449,10 +1624,13 @@ async def live_dashboard_loop() -> None:
 
 
 async def generate_statistics_embed(guild: discord.Guild, interval: int) -> discord.Embed:
-    """Builds the live statistics dashboard embed."""
+    """Aggregates active and archived polls, quorum thresholds, and isolation counts for dashboard."""
     active_count, median_threshold, _ = await get_active_users_stats(guild.id)
 
-    all_polls = list(POLLS_CACHE.values())
+    combined_map: Dict[str, Dict[str, Any]] = {}
+    combined_map.update(ARCHIVE_CACHE)
+    combined_map.update(POLLS_CACHE)
+    all_polls = list(combined_map.values())
 
     active_polls_count = 0
     cooldown_polls_count = 0
@@ -1498,8 +1676,9 @@ async def generate_statistics_embed(guild: discord.Guild, interval: int) -> disc
         link = f"https://discord.com/channels/{guild.id}/{p['channel_id']}/{p['poll_message_id']}"
         short_q = p.get("quote_content", "").replace("\n", " ")[:48]
         voters_n = len(p.get("votes", {}))
+        reports_n = len(p.get("aci_reports", []))
         recent_lines.append(
-            f"┏ {ico} [`#{p['poll_message_id']}`]({link}) — **`{p['category']} / Тир {p['tier']}`** (Явка: **`{voters_n}/{p['quorum_req']}`**)\n"
+            f"┏ {ico} [`#{p['poll_message_id']}`]({link}) — **`{p['category']} / Тир {p['tier']}`** (Явка: **`{voters_n}/{p['quorum_req']}`** | ⚠️Жалобы: `{reports_n} шт.`)\n"
             f"┗ *{short_q}...*"
         )
 
@@ -1558,7 +1737,7 @@ async def generate_statistics_embed(guild: discord.Guild, interval: int) -> disc
 
 
 # =====================================================================
-# 9. BOT EVENTS & SLASH COMMANDS
+# 9. LIFECYCLE EVENTS & ACTIVITY LOGGING
 # =====================================================================
 
 async def setup_hook() -> None:
@@ -1580,8 +1759,59 @@ async def on_ready() -> None:
 
 
 @bot.event
+async def on_member_join(member: discord.Member) -> None:
+    """Re-applies Isolation role and timeout if an isolated user rejoins the guild."""
+    if member.bot:
+        return
+    now = int(time.time())
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT end_time, reason FROM isolations WHERE user_id = ? AND guild_id = ?",
+            (member.id, member.guild.id)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        return
+
+    end_time, iso_reason = int(row[0]), str(row[1])
+    if end_time > 0 and end_time <= now:
+        return
+
+    iso_role = member.guild.get_role(ISOLATION_ROLE_ID) if ISOLATION_ROLE_ID > 0 else None
+    mem_role = member.guild.get_role(MEMBER_ROLE_ID) if MEMBER_ROLE_ID > 0 else None
+
+    try:
+        if mem_role and mem_role in member.roles:
+            await member.remove_roles(mem_role, reason="АСУ: Возврат режима Изоляции при перезаходе (п. 3.5)")
+        if iso_role:
+            await member.add_roles(iso_role, reason="АСУ: Возврат режима Изоляции при перезаходе (п. 3.5)")
+    except Exception:
+        pass
+
+    rem_sec = (end_time - now) if end_time > 0 else DISCORD_MAX_TIMEOUT_SECONDS
+    target_timeout_sec = min(max(60, rem_sec), DISCORD_MAX_TIMEOUT_SECONDS)
+    try:
+        until_dt = discord.utils.utcnow() + datetime.timedelta(seconds=target_timeout_sec)
+        await member.timeout(until_dt, reason=f"АСУ: Восстановление мута Изоляции при перезаходе ({iso_reason})")
+    except Exception:
+        pass
+
+    log_emb = discord.Embed(
+        title="🔒 Восстановлена Изоляция при перезаходе на сервер",
+        description=(
+            f"**Ограниченный участник:** {member.mention} (`{member.id}`)\n"
+            f"**Причина активной Изоляции:** {iso_reason}"
+        ),
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow()
+    )
+    await log_moderation_action(member.guild, log_emb)
+
+
+@bot.event
 async def on_message(message: discord.Message) -> None:
-    """Buffers message timestamps per user for 30-day quorum calculation."""
+    """Logs message timestamps (without content) for 30-day quorum calculation (Rule 6.7)."""
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
@@ -1600,7 +1830,7 @@ async def on_message(message: discord.Message) -> None:
 
 @tasks.loop(hours=1)
 async def db_cleanup() -> None:
-    """Prunes expired message activity (>30d) and command usage logs (>24h)."""
+    """Purges message logs older than 30 days and command logs older than 24 hours."""
     await flush_message_logs()
     now = time.time()
     thirty_days_ago = now - THIRTY_DAYS_SECONDS
@@ -1615,7 +1845,7 @@ async def db_cleanup() -> None:
 
 
 # =====================================================================
-# /rpoll COMMAND GROUP (STANDARD, IMPEACH, GLOBAL ELECTION)
+# 10. SLASH COMMANDS: POLLS & ELECTIONS
 # =====================================================================
 
 rpoll_group = app_commands.Group(name="rpoll", description="Инициация голосований по архитектуре SVA V. RH")
@@ -1672,6 +1902,7 @@ async def rpoll_standard(
         duration_sec=t_cfg["duration"],
         poll_type="standard",
         target_message_id=target_message.id,
+        source_channel_id=target_message.channel.id,
         requested_poll_channel=poll_channel
     )
 
@@ -1734,6 +1965,7 @@ async def rpoll_impeach(
         poll_type="impeach",
         target_user_id=user.id,
         immune_to_aci=True,
+        protect_from_02=True,
         requested_poll_channel=poll_channel
     )
 
@@ -1804,6 +2036,7 @@ async def rpoll_global_election(
         duration_sec=t_cfg["duration"],
         poll_type="direct_election",
         target_message_id=target_message.id,
+        source_channel_id=target_message.channel.id,
         target_user_id=user.id,
         target_role_id=role.id,
         target_role_name=MANAGER_ROLES[role.id],
@@ -1826,7 +2059,7 @@ async def fetch_message_across_guild(
     msg_id: int,
     preferred_channel: Optional[discord.abc.Messageable] = None
 ) -> Optional[discord.Message]:
-    """Resolves a message by ID from cache, preferred channel, or accessible guild channels."""
+    """Searches cache, current channel, and all readable guild channels for a message ID."""
     cached = discord.utils.get(bot.cached_messages, id=msg_id)
     if cached:
         return cached
@@ -1854,10 +2087,6 @@ async def fetch_message_across_guild(
             continue
     return None
 
-
-# =====================================================================
-# TEMPLATE ELECTION COMMAND (/rpollelection)
-# =====================================================================
 
 @bot.tree.command(name="rpollelection", description="Подать заявку и пройти анкетирование на пост Управленца (п. 7.1)")
 @app_commands.describe(role="Роль должности, на которую вы выдвигаетесь")
@@ -1907,7 +2136,7 @@ async def rpollelection(interaction: discord.Interaction, role: discord.Role):
 
 
 # =====================================================================
-# ACI VALIDATION COMMANDS (/rreject, /rconfirm)
+# 11. SLASH COMMANDS: ACI VALIDATION (/rreject, /rconfirm)
 # =====================================================================
 
 @bot.tree.command(name="rreject", description="Отклонить и заморозить голосование по Стандарту ACI или п. 0.2 (Управленец)")
@@ -1941,7 +2170,7 @@ async def rreject(interaction: discord.Interaction, poll_id: str, reason: app_co
 
         if data.get("protect_from_02") and "0.2" in reason.value:
             return await interaction.response.send_message(
-                "🛡️ **Отказ АСУ (п. 4.5):** Пресечение деструктивной инициативы (п. 0.2) не может применяться для закрытия Публичных апелляций Ограниченных участников!",
+                "🛡️ **Отказ АСУ (п. 4.5):** Пресечение деструктивной инициативы (п. 0.2) не может применяться для закрытия Публичных апелляций Ограниченных участников и голосований, касающихся оценки действий, ограничения прав или снятия Управленцев!",
                 ephemeral=True
             )
 
@@ -2019,7 +2248,7 @@ async def rconfirm(interaction: discord.Interaction, poll_id: str, comment: str 
                 ephemeral=True
             )
 
-        # Prevent self-confirmation by poll initiator (Rule 4.1)
+        # Disallow self-confirmation by poll initiator (Rule 4.1)
         if interaction.user.id == data.get("initiator_id"):
             return await interaction.response.send_message(
                 "❌ **Конфликт интересов (п. 4.1):** Вы не можете самостоятельно подтверждать легитимность (`ACI`) собственного голосования. Проверку должен провести другой Управленец.",
@@ -2028,7 +2257,7 @@ async def rconfirm(interaction: discord.Interaction, poll_id: str, comment: str 
 
         was_frozen = (status == "rejected_frozen")
         if was_frozen:
-            # Enforce cross-control by a different manager (Rule 3.3.1)
+            # Require a different Manager to overturn a rejection (Rule 3.3.1)
             if interaction.user.id == data.get("reject_by_id"):
                 return await interaction.response.send_message(
                     "❌ **Нарушение процедуры перекрёстного контроля (п. 3.3.1):** Вы не можете самостоятельно разморозить и защитить щитом голосование, отклонённое вами же через `/rreject`. Перепроверку должен выполнить **другой Управленец**.",
@@ -2072,7 +2301,7 @@ async def rconfirm(interaction: discord.Interaction, poll_id: str, comment: str 
 
 
 # =====================================================================
-# ISOLATION & APPEAL COMMANDS (/risolation, /runisolation, /rappeal)
+# 12. SLASH COMMANDS: ISOLATION & APPEALS (/risolation, /runisolation, /rappeal)
 # =====================================================================
 
 @bot.tree.command(name="risolation", description="Поместить участника в Изоляцию с мутом (п. 3.5 Регламента, лимит: 3 в 24ч)")
@@ -2127,6 +2356,7 @@ async def risolation(
     if not iso_role:
         return await interaction.followup.send(f"❌ На сервере не настроена или не найдена роль Изоляции (`ISOLATION_ROLE_ID = {ISOLATION_ROLE_ID}`).")
 
+    # Suspend Manager and Full Member roles during Isolation (Rules 3.5, 7.3)
     saved_manager_roles = [r.id for r in user.roles if r.id in MANAGER_ROLES]
     roles_to_remove = [r for r in user.roles if r.id in MANAGER_ROLES]
     if mem_role and mem_role in user.roles and mem_role not in roles_to_remove:
@@ -2171,7 +2401,9 @@ async def risolation(
 
     await record_command_usage(interaction.user.id, interaction.guild.id, "risolation")
 
+    # Purge votes from active polls and sync UI if isolated account is a confirmed twink (Rules 1.2, 2.6)
     purged_polls = 0
+    affected_polls: List[Dict[str, Any]] = []
     if is_twink:
         uid_str = str(user.id)
         async with file_lock:
@@ -2180,6 +2412,10 @@ async def risolation(
                     del pdata["votes"][uid_str]
                     purged_polls += 1
                     save_poll_data(poll_id, pdata)
+                    affected_polls.append(pdata)
+
+    for pdata in affected_polls:
+        await sync_poll_message_ui(pdata)
 
     human_dur = format_duration_human(duration_seconds)
     duration_str = f"До <t:{end_time}:f> (<t:{end_time}:R>, `{human_dur}`)" if end_time > 0 else human_dur
@@ -2398,7 +2634,7 @@ if hasattr(app_commands, "allowed_installs"):
 
 
 # =====================================================================
-# ROLE MANAGEMENT COMMANDS (/relection, /rselfimpeach)
+# 13. SLASH COMMANDS: STAFF ROLES & DASHBOARD (/relection, /rselfimpeach, /rstatistics)
 # =====================================================================
 
 @bot.tree.command(name="relection", description="Техническая выдача роли Управленца с задержкой 30 мин. (лимит: 3 в 24ч)")
@@ -2555,10 +2791,6 @@ async def rselfimpeach(
     )
 
 
-# =====================================================================
-# STATISTICS & INFORMATION COMMANDS (/rstatistics, /rlist, /ractivelist, /rhelp)
-# =====================================================================
-
 @bot.tree.command(name="rstatistics", description="Создать вечный самообновляющийся виджет статистики АСУ (Пункт 7 ТЗ)")
 @app_commands.describe(seconds="Интервал автообновления виджета в секундах (рекомендуется от 30 сек.)")
 async def rstatistics(interaction: discord.Interaction, seconds: int = 60):
@@ -2608,11 +2840,12 @@ async def rlist(interaction: discord.Interaction):
 
             status_ico = {"cooldown": "🧊", "active": "📊", "rejected_frozen": "⏸️"}.get(data.get("status"), "📊")
             shield_ico = "🛡️" if data.get("aci_shield") else ("⚡" if data.get("immune_to_aci") else "")
+            reports_n = len(data.get("aci_reports", []))
             line = (
                 f"**{len(description_lines)+1}.** {status_ico}{shield_ico} "
                 f"[{data['category']} / {data['tier']}]({msg_link}) — ID: `{data['poll_message_id']}`\n"
                 f"> *{quote}*\n"
-                f"Итоги: <t:{data['end_time']}:R> | Голосов: **{len(data.get('votes', {}))}/{data['quorum_req']}**"
+                f"Итоги: <t:{data['end_time']}:R> | Голосов: **{len(data.get('votes', {}))}/{data['quorum_req']}** | ⚠️Жалобы: `{reports_n} шт.`"
             )
             description_lines.append(line)
         except Exception:
@@ -2691,8 +2924,9 @@ async def rhelp(interaction: discord.Interaction):
 
 
 # =====================================================================
-# ENTRYPOINT
+# 14. ENTRYPOINT
 # =====================================================================
+
 if __name__ == "__main__":
     if PROXY_URL:
         bot.run(BOT_TOKEN, proxy=PROXY_URL)
