@@ -484,6 +484,34 @@ def has_command_permission(member: discord.Member, command_key: str) -> bool:
     return any(role.id in allowed_roles for role in member.roles)
 
 
+def round_half_up(value: float) -> int:
+    return int(math.floor(value + 0.5))
+
+
+def get_rconfirm_quorum_stats(guild: Optional[discord.Guild]) -> Tuple[int, int]:
+    if not guild:
+        return 1, 1
+    allowed_roles = set(COMMAND_PERMISSIONS.get("rconfirm", ()))
+    if not allowed_roles:
+        return 1, 0
+    eligible_count = sum(
+        1 for m in guild.members
+        if not m.bot and any(r.id in allowed_roles for r in m.roles)
+    )
+    required_count = max(1, round_half_up(eligible_count / 5.0))
+    return required_count, eligible_count
+
+
+def resolve_poll_confirm_thresholds(data: Dict[str, Any]) -> Tuple[int, int]:
+    guild = bot.get_guild(data.get("guild_id", GUILD_ID))
+    if guild:
+        req_count, total_eligible = get_rconfirm_quorum_stats(guild)
+        data["confirm_req"] = req_count
+        data["confirm_eligible_total"] = total_eligible
+        return req_count, total_eligible
+    return max(1, int(data.get("confirm_req", 1))), int(data.get("confirm_eligible_total", 1))
+
+
 def check_full_member_status(member: discord.Member) -> Tuple[bool, str]:
     """Verifies member holds Full Member role and is not under Isolation (Rules 0.3, 3.5)."""
     user_role_ids = {r.id for r in member.roles}
@@ -564,6 +592,9 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
     poll_id = data.get("poll_message_id", "ID_ГОЛОСОВАНИЯ")
     voters_count = len(data.get("votes", {}))
     reports_count = len(data.get("aci_reports", []))
+    confirmations = data.get("aci_confirmations", [])
+    confirms_count = len(confirmations)
+    req_confirms, eligible_total = resolve_poll_confirm_thresholds(data)
 
     if status == "cooldown":
         title_prefix = "🧊 [Охлаждение]"
@@ -662,19 +693,27 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
         )
 
     if data.get("immune_to_aci"):
-        aci_text = "⚡ Иммунитет от отмены по ACI (п. 6.8)"
-    elif data.get("aci_shield"):
-        confirmed_by = data.get("confirmed_by_name", "Управленцем")
-        aci_text = f"🛡️ Подтверждено и защищено щитом ACI ({confirmed_by}, п. 3.3.1)"
-    elif data.get("protect_from_02"):
-        aci_text = "🛡️ Защищено от отмены по п. 0.2 (п. 4.5)"
+        aci_field_value = (
+            f"┏ ⚡ Иммунитет от отмены по ACI (п. 6.8)\n"
+            f"┗ ⚠️Жалобы: `{reports_count} шт.`"
+        )
     else:
-        aci_text = None
+        aci_lines = []
+        if data.get("aci_shield"):
+            confirmed_by = data.get("confirmed_by_name", "Управленцем")
+            aci_lines.append(f"┏ 🛡️ Подтверждено и защищено щитом ACI ({confirmed_by}, п. 3.3.1)")
+        elif data.get("protect_from_02"):
+            aci_lines.append("┏ 🛡️ Защищено от отмены по п. 0.2 (п. 4.5)")
 
-    if aci_text:
-        aci_field_value = f"┏ {aci_text}\n┗ ⚠️Жалобы: `{reports_count} шт.`"
-    else:
-        aci_field_value = f"⚠️Жалобы: `{reports_count} шт.`"
+        line_prefix = "┃" if aci_lines else "┏"
+        aci_lines.append(
+            f"{line_prefix} ⚖️ **Предохранитель ACI:** `/rreject` — `1 чел.` | `/rconfirm` — `{confirms_count}/{req_confirms} чел.` (1/5 от `{eligible_total}` с доступом)"
+        )
+        if confirms_count > 0 and not data.get("aci_shield"):
+            confirmed_mentions = ", ".join(f"<@{c['user_id']}>" for c in confirmations)
+            aci_lines.append(f"┃ ✅ **Подтвердили `/rconfirm`:** {confirmed_mentions}")
+        aci_lines.append(f"┗ ⚠️Жалобы: `{reports_count} шт.`")
+        aci_field_value = "\n".join(aci_lines)
 
     embed.add_field(name="🛡️ Статус ACI", value=aci_field_value, inline=False)
 
@@ -691,6 +730,7 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
         timer_block = (
             f"┏ 🛑 **Отклонил:** <@{data.get('reject_by_id', 0)}>\n"
             f"┃ 📌 **Причина:** {data.get('reject_reason', 'Не указано')}\n"
+            f"┃ 🛡️ **Для разморозки `/rconfirm`:** `{confirms_count}/{req_confirms} чел.` (1/5 от `{eligible_total}` с доступом)\n"
             f"┃ ⏱️ **Остаток времени:** `{rem_min} мин.`\n"
             f"┗ 🔄 **Окно `/rconfirm` (п. 3.3.1) до:** <t:{deadline}:f> (<t:{deadline}:R>)"
         )
@@ -769,6 +809,8 @@ class ACIReportModal(discord.ui.Modal, title="Запрос на проверку
                 "timestamp": int(time.time())
             })
             reports_count = len(reports)
+            req_confirms, eligible_total = resolve_poll_confirm_thresholds(data)
+            confirms_count = len(data.get("aci_confirmations", []))
             save_poll_data(self.poll_id, data)
 
         await sync_poll_message_ui(data)
@@ -781,8 +823,8 @@ class ACIReportModal(discord.ui.Modal, title="Запрос на проверку
                 f"**Всего жалоб на опросе:** `{reports_count} шт.`\n\n"
                 f"**Суть несоответствия ACI:**\n> {self.violation_details.value}\n\n"
                 f"🔧 **Действия Управленца (п. 3.3):**\n"
-                f"• Подтвердить и выдать щит: `/rconfirm poll_id:{self.poll_id}`\n"
-                f"• Отклонить и заморозить: `/rreject poll_id:{self.poll_id}`"
+                f"• Подтвердить и выдать щит (`{confirms_count}/{req_confirms}`, 1/5 от `{eligible_total}`): `/rconfirm poll_id:{self.poll_id}`\n"
+                f"• Отклонить и заморозить (`1 чел.`): `/rreject poll_id:{self.poll_id}`"
             ),
             color=discord.Color.gold(),
             timestamp=discord.utils.utcnow()
@@ -1110,6 +1152,7 @@ async def launch_poll_instance(
 
     active_users_count, _, _ = await get_active_users_stats(guild.id)
     quorum_req = max(1, math.ceil(active_users_count * (quorum_pct / 100.0)))
+    confirm_req, confirm_eligible_total = get_rconfirm_quorum_stats(guild)
 
     now = int(time.time())
     start_time = now + cooldown_sec
@@ -1140,6 +1183,8 @@ async def launch_poll_instance(
         "tier": tier_name,
         "win_pct": win_pct,
         "quorum_req": quorum_req,
+        "confirm_req": confirm_req,
+        "confirm_eligible_total": confirm_eligible_total,
         "created_at": now,
         "start_time": start_time,
         "end_time": end_time,
@@ -1150,6 +1195,7 @@ async def launch_poll_instance(
         "immune_to_aci": immune_to_aci,
         "protect_from_02": protect_from_02,
         "aci_shield": False,
+        "aci_confirmations": [],
         "aci_reports": [],
         "votes": {}
     }
@@ -2190,6 +2236,7 @@ async def rreject(interaction: discord.Interaction, poll_id: str, reason: app_co
             rem_cooldown = 0
             rem_duration = max(60, data["end_time"] - now)
 
+        req_confirms, eligible_total = get_rconfirm_quorum_stats(interaction.guild)
         data["status"] = "rejected_frozen"
         data["rejected_at"] = now
         data["remaining_cooldown"] = rem_cooldown
@@ -2198,6 +2245,9 @@ async def rreject(interaction: discord.Interaction, poll_id: str, reason: app_co
         data["reject_by_id"] = interaction.user.id
         data["reject_by_name"] = interaction.user.display_name
         data["reject_reason"] = f"{reason.value} — {comment}"
+        data["aci_confirmations"] = []
+        data["confirm_req"] = req_confirms
+        data["confirm_eligible_total"] = eligible_total
 
         save_poll_data(poll_id, data)
 
@@ -2211,6 +2261,7 @@ async def rreject(interaction: discord.Interaction, poll_id: str, reason: app_co
             f"**Основание:** {reason.value}\n"
             f"**Комментарий (п. 4.3):** {comment}\n"
             f"**Сохранённый остаток таймера:** `{math.ceil(rem_duration / 60)} мин.`\n"
+            f"**Требуется для разморозки (`/rconfirm`):** `{req_confirms} чел.` (1/5 от `{eligible_total}` с доступом)\n"
             f"**Окно восстановления (`/rconfirm` по п. 3.3.1) до:** <t:{data['appeal_deadline']}:f>"
         ),
         color=discord.Color.orange(),
@@ -2218,7 +2269,8 @@ async def rreject(interaction: discord.Interaction, poll_id: str, reason: app_co
     )
     await log_moderation_action(interaction.guild, log_emb)
     await interaction.response.send_message(
-        f"✅ Голосование `{poll_id}` отклонено по ACI и переведено в режим ожидания перекрёстного контроля.",
+        f"✅ Голосование `{poll_id}` отклонено по ACI и переведено в режим ожидания перекрёстного контроля "
+        f"(для разморозки требуется `/rconfirm` от `{req_confirms}` из `{eligible_total}` уполномоченных Управленцев).",
         ephemeral=True
     )
 
@@ -2248,6 +2300,12 @@ async def rconfirm(interaction: discord.Interaction, poll_id: str, comment: str 
                 ephemeral=True
             )
 
+        if data.get("aci_shield"):
+            return await interaction.response.send_message(
+                "🛡️ Это голосование уже набрало необходимое число подтверждений `/rconfirm` и защищено щитом ACI.",
+                ephemeral=True
+            )
+
         # Disallow self-confirmation by poll initiator (Rule 4.1)
         if interaction.user.id == data.get("initiator_id"):
             return await interaction.response.send_message(
@@ -2269,31 +2327,68 @@ async def rconfirm(interaction: discord.Interaction, poll_id: str, comment: str 
                 save_poll_data(poll_id, data)
                 return await interaction.response.send_message("❌ Срок восстановления этого голосования истёк.", ephemeral=True)
 
-            rem_cd = data.get("remaining_cooldown", 0)
-            rem_dur = data.get("remaining_duration", 3600)
-            data["start_time"] = now + rem_cd
-            data["end_time"] = data["start_time"] + rem_dur
-            data["status"] = "cooldown" if rem_cd > 0 else "active"
+        confirmations = data.setdefault("aci_confirmations", [])
+        if any(c.get("user_id") == interaction.user.id for c in confirmations):
+            return await interaction.response.send_message(
+                "⚠️ Вы уже подтверждали легитимность этого голосования через `/rconfirm`.",
+                ephemeral=True
+            )
 
-        data["aci_shield"] = True
-        data["confirmed_by_id"] = interaction.user.id
-        data["confirmed_by_name"] = interaction.user.display_name
-        data["confirm_comment"] = comment
+        confirmations.append({
+            "user_id": interaction.user.id,
+            "username": interaction.user.display_name,
+            "comment": comment,
+            "timestamp": now
+        })
+
+        req_confirms, eligible_total = get_rconfirm_quorum_stats(interaction.guild)
+        data["confirm_req"] = req_confirms
+        data["confirm_eligible_total"] = eligible_total
+        confirms_count = len(confirmations)
+        shield_activated = (confirms_count >= req_confirms)
+
+        if shield_activated:
+            if was_frozen:
+                rem_cd = data.get("remaining_cooldown", 0)
+                rem_dur = data.get("remaining_duration", 3600)
+                data["start_time"] = now + rem_cd
+                data["end_time"] = data["start_time"] + rem_dur
+                data["status"] = "cooldown" if rem_cd > 0 else "active"
+
+            data["aci_shield"] = True
+            data["confirmed_by_id"] = interaction.user.id
+            data["confirmed_by_name"] = ", ".join(c["username"] for c in confirmations)
+            data["confirm_comment"] = comment
 
         save_poll_data(poll_id, data)
 
     await sync_poll_message_ui(data)
 
-    action_str = "Восстановлено из заморозки и защищено щитом ACI (п. 3.3.1)" if was_frozen else "Подтверждено и защищено щитом ACI (п. 3.3)"
+    if shield_activated:
+        action_str = (
+            f"Восстановлено из заморозки и защищено щитом ACI (`{confirms_count}/{req_confirms}`, 1/5 от `{eligible_total}`, п. 3.3.1)"
+            if was_frozen else
+            f"Подтверждено и защищено щитом ACI (`{confirms_count}/{req_confirms}`, 1/5 от `{eligible_total}`, п. 3.3)"
+        )
+        embed_color = discord.Color.green()
+    else:
+        remaining_needed = req_confirms - confirms_count
+        action_str = (
+            f"Голос `/rconfirm` учтён (`{confirms_count}/{req_confirms}`, 1/5 от `{eligible_total}` с доступом). "
+            f"Для {'разморозки и ' if was_frozen else ''}активации щита ACI требуется ещё `{remaining_needed} чел.`"
+        )
+        embed_color = discord.Color.gold()
+
     log_emb = discord.Embed(
-        title="🛡️ Валидация ACI подтверждена (/rconfirm)",
+        title="🛡️ Валидация ACI подтверждена (/rconfirm)" if shield_activated else "⏳ Промежуточное подтверждение ACI (/rconfirm)",
         description=(
             f"**ID голосования:** `{poll_id}`\n"
             f"**Управленец:** {interaction.user.mention}\n"
+            f"**Прогресс предохранителя (1/5):** `{confirms_count}/{req_confirms} чел.` (всего с доступом: `{eligible_total}`)\n"
             f"**Действие:** {action_str}\n"
             f"**Комментарий:** {comment}"
         ),
-        color=discord.Color.green(),
+        color=embed_color,
         timestamp=discord.utils.utcnow()
     )
     await log_moderation_action(interaction.guild, log_emb)
@@ -2910,8 +3005,8 @@ async def rhelp(interaction: discord.Interaction):
         "### 🕊️ Защита прав Ограниченных участников (Раздел 5):\n"
         "- `/rappeal <ID сообщения или ссылка из ЛС>` — подать Публичную апелляцию напрямую из ЛС с ботом (п. 5.1). При победе АСУ автоматически снимает Изоляцию и возвращает все изъятые роли.\n\n"
         "### 🛡️ Инструменты Управленцев (Разделы 3, 4, 7):\n"
-        "- `/rreject <ID> <Основание> <Комментарий>` — отклонить и заморозить опрос по ACI или п. 0.2.\n"
-        "- `/rconfirm <ID> [Комментарий]` — подтвердить ACI (наложить щит или разморозить по п. 3.3.1).\n"
+        "- `/rreject <ID> <Основание> <Комментарий>` — отклонить и заморозить опрос по ACI или п. 0.2 (**требуется 1 чел.**).\n"
+        "- `/rconfirm <ID> [Комментарий]` — подтвердить ACI (наложить щит или разморозить по п. 3.3.1, **требуется 1/5 от имеющих доступ к `/rconfirm` с округлением по половине**).\n"
         "- `/risolation <@Юзер> <Причина> [Срок: Ns/Nh/Nd/Nm/Ny] [Твинк]` — перевести в Изоляцию с мутом (п. 3.5, **лимит: до 3 раз в 24 часа**).\n"
         "- `/runisolation <@Юзер> [Причина]` — досрочно снять Изоляцию и вернуть все изъятые роли.\n"
         "- `/relection <@Юзер> <@Роль> [Причина]` — выдать роль по иерархии с задержкой 30 мин. (**лимит: до 3 раз в 24 часа**).\n"
