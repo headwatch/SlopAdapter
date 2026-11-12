@@ -11,21 +11,19 @@ import math
 import re
 import datetime
 import hashlib
+import io
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 # =====================================================================
 # 1. GLOBAL CONFIGURATION & PERMISSION MATRIX
 # =====================================================================
 
-BOT_TOKEN = "YOUR_TOKEN"
+BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
 PROXY_URL = None
 
-# Authorized Platform IDs (guild_id -> platform name).
-# The bot will strictly refuse to operate on any Discord server not listed here.
+# Authorized Platform ID (Discord Server ID).
+# The bot will strictly refuse to operate on any server other than this ID.
 REGISTERED_PLATFORM_ID: int = 0
-REGISTERED_PLATFORMS: Dict[int, str] = {
-    # 123456789012345678: "General",
-}
 
 POLLS_CHANNEL_IDS: List[int] = [
     # 123456789012345679,
@@ -180,27 +178,74 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
-
-def get_registered_platform_ids() -> Set[int]:
-    """Returns the set of explicitly authorized Platform (guild) IDs."""
-    allowed: Set[int] = {int(gid) for gid in REGISTERED_PLATFORMS.keys() if int(gid) > 0}
-    if REGISTERED_PLATFORM_ID and REGISTERED_PLATFORM_ID > 0:
-        allowed.add(int(REGISTERED_PLATFORM_ID))
-    return allowed
+MAX_CLONED_ATTACHMENT_BYTES = 8 * 1024 * 1024  # 8 MB per attachment for cloning into poll message
 
 
 def is_authorized_platform(guild_id: Optional[int]) -> bool:
-    """Checks whether the given guild_id belongs to REGISTERED_PLATFORMS / REGISTERED_PLATFORM_ID."""
-    if guild_id is None:
+    """Checks whether the given guild_id matches REGISTERED_PLATFORM_ID."""
+    if guild_id is None or REGISTERED_PLATFORM_ID <= 0:
         return False
-    allowed = get_registered_platform_ids()
-    return int(guild_id) in allowed
+    return int(guild_id) == int(REGISTERED_PLATFORM_ID)
 
 
-def get_authorized_guilds() -> List[discord.Guild]:
-    """Returns all connected Discord guilds that are authorized in REGISTERED_PLATFORMS."""
-    allowed = get_registered_platform_ids()
-    return [g for g in bot.guilds if g.id in allowed]
+def get_authorized_guild() -> Optional[discord.Guild]:
+    """Returns the connected Discord guild matching REGISTERED_PLATFORM_ID."""
+    if REGISTERED_PLATFORM_ID <= 0:
+        return None
+    return bot.get_guild(int(REGISTERED_PLATFORM_ID))
+
+
+async def extract_message_payload(
+    target_message: discord.Message,
+    include_jump_link: bool = True
+) -> Tuple[str, Optional[str], List[Dict[str, str]], List[discord.File]]:
+    """
+    Extracts text, clones attachments (txt/md/media) into discord.File objects,
+    reads text previews from attached .txt/.md files if needed, and computes SHA-256 hashes (Rule 6.4.1).
+    """
+    base_text = (target_message.content or "").strip()
+    jump_url = target_message.jump_url if (include_jump_link and target_message.guild is not None) else None
+    attachments_meta: List[Dict[str, str]] = []
+    cloned_files: List[discord.File] = []
+    extracted_txt_blocks: List[str] = []
+
+    for att in target_message.attachments:
+        if att.size > MAX_CLONED_ATTACHMENT_BYTES:
+            attachments_meta.append({
+                "filename": att.filename,
+                "sha256": "превышен_лимит_8МБ",
+                "url": att.url
+            })
+            continue
+        try:
+            raw_bytes = await att.read()
+            file_hash = hashlib.sha256(raw_bytes).hexdigest()
+            attachments_meta.append({
+                "filename": att.filename,
+                "sha256": file_hash[:12],
+                "url": att.url
+            })
+            cloned_files.append(discord.File(io.BytesIO(raw_bytes), filename=att.filename))
+
+            # If a .txt or .md document is attached, extract a text preview for the embed
+            if att.filename.lower().endswith((".txt", ".md")):
+                try:
+                    decoded_txt = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    decoded_txt = raw_bytes.decode("cp1251", errors="replace")
+                cleaned_txt = decoded_txt.strip()
+                if cleaned_txt:
+                    extracted_txt_blocks.append(f"📄 [Из файла {att.filename}]:\n{cleaned_txt}")
+        except Exception as e:
+            print(f"[Attachment Clone Error on {att.filename}]: {e}")
+
+    if extracted_txt_blocks:
+        txt_combined = "\n\n".join(extracted_txt_blocks)
+        quote_content = f"{base_text}\n\n{txt_combined}".strip() if base_text else txt_combined
+    else:
+        quote_content = base_text or "[Вложение / Медиафайл]"
+
+    return quote_content, jump_url, attachments_meta, cloned_files
 
 
 def write_json_atomic(filepath: str, data: Dict[str, Any]) -> None:
@@ -519,7 +564,7 @@ def has_command_permission(member: discord.Member, command_key: str) -> bool:
 async def check_full_member_status(member: discord.Member) -> Tuple[bool, str]:
     """Verifies platform authorization, full member status, absence of isolation, and non-twink status."""
     if not is_authorized_platform(member.guild.id):
-        return False, "⛔ Данный сервер не входит в список авторизованных Площадок АСУ (`REGISTERED_PLATFORMS`)."
+        return False, "⛔ Данный сервер не является авторизованной Площадкой АСУ (`REGISTERED_PLATFORM_ID`)."
 
     user_role_ids = {r.id for r in member.roles}
     if ISOLATION_ROLE_ID > 0 and ISOLATION_ROLE_ID in user_role_ids:
@@ -711,6 +756,18 @@ def build_poll_embed(data: Dict[str, Any]) -> discord.Embed:
             inline=False
         )
 
+    if data.get("source_jump_url") or data.get("attachments_meta"):
+        mat_lines = []
+        if data.get("source_jump_url"):
+            mat_lines.append(f"🔗 **Оригинал сообщения:** [Перейти к источнику]({data['source_jump_url']})")
+        for att_info in data.get("attachments_meta", []):
+            mat_lines.append(f"📎 `{att_info['filename']}` (SHA256: `{att_info['sha256']}`)")
+        embed.add_field(
+            name="📦 Материалы инициативы (п. 6.4.1)",
+            value="\n".join(mat_lines)[:1024],
+            inline=False
+        )
+
     aci_lines = []
     if data.get("immune_to_aci"):
         aci_lines.append("⚡ **Иммунитет от отмены (п. 6.8)**")
@@ -811,7 +868,7 @@ class ACIReportModal(discord.ui.Modal, title="Запрос на проверку
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not is_authorized_platform(interaction.guild.id):
             return await interaction.response.send_message(
-                "⛔ Доступно только на авторизованной Площадке (`REGISTERED_PLATFORMS`).",
+                "⛔ Доступно только на авторизованной Площадке (`REGISTERED_PLATFORM_ID`).",
                 ephemeral=True
             )
 
@@ -881,7 +938,7 @@ class PollVotingView(discord.ui.View):
 
         if not is_authorized_platform(interaction.guild.id):
             return await interaction.response.send_message(
-                "⛔ Отказ доступа АСУ: данный сервер не зарегистрирован в `REGISTERED_PLATFORMS`.",
+                "⛔ Отказ доступа АСУ: данный сервер не соответствует `REGISTERED_PLATFORM_ID`.",
                 ephemeral=True
             )
 
@@ -959,7 +1016,7 @@ class PollVotingView(discord.ui.View):
     async def check_my_vote(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not is_authorized_platform(interaction.guild.id):
             return await interaction.response.send_message(
-                "⛔ Отказ доступа АСУ: сервер не авторизован в `REGISTERED_PLATFORMS`.",
+                "⛔ Отказ доступа АСУ: сервер не авторизован в `REGISTERED_PLATFORM_ID`.",
                 ephemeral=True
             )
 
@@ -983,7 +1040,7 @@ class PollVotingView(discord.ui.View):
     async def report_aci(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not is_authorized_platform(interaction.guild.id):
             return await interaction.response.send_message(
-                "⛔ Отказ доступа АСУ: сервер не авторизован в `REGISTERED_PLATFORMS`.",
+                "⛔ Отказ доступа АСУ: сервер не авторизован в `REGISTERED_PLATFORM_ID`.",
                 ephemeral=True
             )
 
@@ -1153,9 +1210,12 @@ async def launch_poll_instance(
     immune_to_aci: bool = False,
     protect_from_02: bool = False,
     destination_channel_id: Optional[int] = None,
-    requested_poll_channel: Optional[discord.TextChannel] = None
+    requested_poll_channel: Optional[discord.TextChannel] = None,
+    source_jump_url: Optional[str] = None,
+    attachments_meta: Optional[List[Dict[str, str]]] = None,
+    cloned_files: Optional[List[discord.File]] = None
 ) -> Optional[discord.Message]:
-    """Creates, freezes content snapshot (Rule 6.4.1), publishes, and persists a poll on an authorized Platform."""
+    """Creates, freezes content & file snapshot (Rule 6.4.1), publishes, and persists a poll on the Platform."""
     if not is_authorized_platform(guild.id):
         return None
 
@@ -1180,8 +1240,9 @@ async def launch_poll_instance(
     end_time = start_time + duration_sec
     status = "cooldown" if cooldown_sec > 0 else "active"
 
-    # Immutable cryptographic snapshot of initial proposal composition (Rule 6.4.1)
-    snapshot_payload = f"{category}|{tier_name}|{win_pct}|{quorum_pct}|{duration_sec}|{quote_content}"
+    att_hashes_str = ",".join(f"{a['filename']}:{a['sha256']}" for a in (attachments_meta or []))
+    # Immutable cryptographic snapshot of initial proposal composition + attached files (Rule 6.4.1)
+    snapshot_payload = f"{category}|{tier_name}|{win_pct}|{quorum_pct}|{duration_sec}|{quote_content}|{att_hashes_str}"
     content_sha256 = hashlib.sha256(snapshot_payload.encode("utf-8")).hexdigest()
 
     poll_data: Dict[str, Any] = {
@@ -1194,6 +1255,8 @@ async def launch_poll_instance(
         "target_message_id": target_message_id,
         "target_author_name": target_author_name,
         "quote_content": quote_content,
+        "source_jump_url": source_jump_url,
+        "attachments_meta": attachments_meta or [],
         "content_sha256": content_sha256,
         "category": category,
         "tier": tier_name,
@@ -1216,7 +1279,10 @@ async def launch_poll_instance(
     initial_embed = build_poll_embed(poll_data)
     view = PollVotingView(poll_data)
     try:
-        poll_msg = await channel.send(embed=initial_embed, view=view)
+        if cloned_files:
+            poll_msg = await channel.send(embed=initial_embed, view=view, files=cloned_files)
+        else:
+            poll_msg = await channel.send(embed=initial_embed, view=view)
     except Exception as e:
         print(f"[Launch Poll Send Error]: {e}")
         return None
@@ -1858,13 +1924,13 @@ async def generate_statistics_embed(guild: discord.Guild, interval: int) -> disc
 async def global_platform_interaction_check(interaction: discord.Interaction) -> bool:
     """
     Global guard for all Slash Commands:
-    - If invoked inside a guild, the guild ID MUST be in REGISTERED_PLATFORMS / REGISTERED_PLATFORM_ID.
+    - If invoked inside a guild, the guild ID MUST match REGISTERED_PLATFORM_ID.
     - If invoked in Direct Messages (guild is None), only /rappeal and /rhelp are permitted.
     """
     if interaction.guild is not None:
         if not is_authorized_platform(interaction.guild.id):
             await interaction.response.send_message(
-                "⛔ **Отказ доступа АСУ:** данный сервер не зарегистрирован в списке авторизованных Площадок (`REGISTERED_PLATFORMS`). Работа бота здесь заблокирована.",
+                "⛔ **Отказ доступа АСУ:** данный сервер не соответствует `REGISTERED_PLATFORM_ID`. Работа бота здесь заблокирована.",
                 ephemeral=True
             )
             return False
@@ -1896,9 +1962,8 @@ bot.setup_hook = setup_hook
 
 @bot.event
 async def on_ready() -> None:
-    allowed = get_registered_platform_ids()
     print(f"[АСУ RedAdapter | SVA V. RH] Запущен как: {bot.user} (ID: {bot.user.id})")
-    print(f"[АСУ RedAdapter] Авторизованные Площадки (REGISTERED_PLATFORMS): {allowed or 'НЕ ЗАДАНЫ!'}")
+    print(f"[АСУ RedAdapter] Авторизованная Площадка (REGISTERED_PLATFORM_ID): {REGISTERED_PLATFORM_ID or 'НЕ ЗАДАНА!'}")
     for task_loop in (poll_checker, system_maintenance_loop, live_dashboard_loop, db_cleanup):
         if not task_loop.is_running():
             task_loop.start()
@@ -2020,6 +2085,8 @@ async def rpoll_standard(
     if not target_message:
         return await interaction.followup.send("⚠️ Сообщение с указанным ID не найдено на Площадке.")
 
+    quote_content, jump_url, att_meta, cloned_files = await extract_message_payload(target_message, include_jump_link=True)
+
     cat_name = category.value
     tier_name = CATEGORIES[cat_name]
     t_cfg = TIERS[tier_name]
@@ -2029,7 +2096,7 @@ async def rpoll_standard(
         fallback_channel=interaction.channel,
         initiator=interaction.user,
         target_author_name=target_message.author.display_name,
-        quote_content=target_message.content or "[Вложение / Медиафайл]",
+        quote_content=quote_content,
         category=cat_name,
         tier_name=tier_name,
         win_pct=t_cfg["win_pct"],
@@ -2038,7 +2105,10 @@ async def rpoll_standard(
         duration_sec=t_cfg["duration"],
         poll_type="standard",
         target_message_id=target_message.id,
-        requested_poll_channel=poll_channel
+        requested_poll_channel=poll_channel,
+        source_jump_url=jump_url,
+        attachments_meta=att_meta,
+        cloned_files=cloned_files
     )
 
     if poll_msg:
@@ -2176,13 +2246,15 @@ async def rpoll_global_election(
     if not target_message:
         return await interaction.followup.send("⚠️ Сообщение с текстом выдвижения не найдено.")
 
+    quote_content, jump_url, att_meta, cloned_files = await extract_message_payload(target_message, include_jump_link=True)
+
     t_cfg = TIERS["High"]
     poll_msg = await launch_poll_instance(
         guild=interaction.guild,
         fallback_channel=interaction.channel,
         initiator=interaction.user,
         target_author_name=target_message.author.display_name,
-        quote_content=target_message.content or "[Текст программы отсутствует]",
+        quote_content=quote_content,
         category="Стафф",
         tier_name="High",
         win_pct=t_cfg["win_pct"],
@@ -2196,7 +2268,10 @@ async def rpoll_global_election(
         target_role_name=MANAGER_ROLES[role.id],
         immune_to_aci=False,
         protect_from_02=True,
-        requested_poll_channel=poll_channel
+        requested_poll_channel=poll_channel,
+        source_jump_url=jump_url,
+        attachments_meta=att_meta,
+        cloned_files=cloned_files
     )
 
     if poll_msg:
@@ -2789,40 +2864,36 @@ async def rappeal(interaction: discord.Interaction, message_id: str):
         return await interaction.followup.send("⚠️ Укажите корректный числовой ID вашего сообщения (или ссылку на него), отправленного в ЛС боту.")
     parsed_msg_id = int(id_matches[-1])
 
-    # Strictly check ONLY authorized platforms from REGISTERED_PLATFORMS / REGISTERED_PLATFORM_ID
-    authorized_guilds = get_authorized_guilds()
-    if not authorized_guilds:
-        return await interaction.followup.send("⛔ Бот не подключён ни к одной авторизованной Площадке (`REGISTERED_PLATFORMS`).")
+    # Strictly check ONLY the authorized platform from REGISTERED_PLATFORM_ID
+    target_guild = get_authorized_guild()
+    if not target_guild:
+        return await interaction.followup.send("⛔ Бот не подключён к авторизованной Площадке (`REGISTERED_PLATFORM_ID`).")
 
-    iso_guild_ids: Set[int] = set()
+    in_iso_db = False
     async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT guild_id FROM isolations WHERE user_id = ?", (interaction.user.id,)) as cursor:
-            for row in await cursor.fetchall():
-                if is_authorized_platform(int(row[0])):
-                    iso_guild_ids.add(int(row[0]))
+        async with db.execute(
+            "SELECT 1 FROM isolations WHERE user_id = ? AND guild_id = ?",
+            (interaction.user.id, target_guild.id)
+        ) as cursor:
+            if await cursor.fetchone():
+                in_iso_db = True
 
-    target_guild: Optional[discord.Guild] = None
-    target_member: Optional[discord.Member] = None
+    target_member = target_guild.get_member(interaction.user.id)
+    if not target_member:
+        try:
+            target_member = await target_guild.fetch_member(interaction.user.id)
+        except Exception:
+            target_member = None
 
-    for g in authorized_guilds:
-        m = g.get_member(interaction.user.id)
-        if not m:
-            try:
-                m = await g.fetch_member(interaction.user.id)
-            except Exception:
-                continue
+    has_iso_role = (
+        target_member is not None
+        and ISOLATION_ROLE_ID > 0
+        and any(r.id == ISOLATION_ROLE_ID for r in target_member.roles)
+    )
 
-        has_iso_role = (ISOLATION_ROLE_ID > 0 and any(r.id == ISOLATION_ROLE_ID for r in m.roles))
-        in_iso_db = (g.id in iso_guild_ids)
-
-        if has_iso_role or in_iso_db:
-            target_guild = g
-            target_member = m
-            break
-
-    if not target_guild or not target_member:
+    if not target_member or not (has_iso_role or in_iso_db):
         return await interaction.followup.send(
-            "⛔ **Отказ АСУ:** Вы не найдены на авторизованной Площадке (`REGISTERED_PLATFORMS`) или у вас отсутствует роль/статус Изоляции (`ISOLATION_ROLE_ID`)."
+            "⛔ **Отказ АСУ:** Вы не найдены на авторизованной Площадке (`REGISTERED_PLATFORM_ID`) или у вас отсутствует роль/статус Изоляции (`ISOLATION_ROLE_ID`)."
         )
 
     for pdata in POLLS_CACHE.values():
@@ -2863,9 +2934,10 @@ async def rappeal(interaction: discord.Interaction, message_id: str):
     if target_msg.author.id != interaction.user.id:
         return await interaction.followup.send("⚠️ Для подачи апелляции можно указать только собственное сообщение.")
 
-    if not (target_msg.content and target_msg.content.strip()):
-        return await interaction.followup.send("⚠️ Сообщение с апелляцией должно содержать текстовое обоснование.")
+    if not (target_msg.content and target_msg.content.strip()) and not target_msg.attachments:
+        return await interaction.followup.send("⚠️ Сообщение с апелляцией должно содержать текстовое обоснование или прикреплённый файл.")
 
+    quote_content, _, att_meta, cloned_files = await extract_message_payload(target_msg, include_jump_link=False)
     t_cfg = TIERS["High"]
 
     poll_msg = await launch_poll_instance(
@@ -2873,7 +2945,7 @@ async def rappeal(interaction: discord.Interaction, message_id: str):
         fallback_channel=None,
         initiator=interaction.user,
         target_author_name=f"{target_member.display_name} (Ограниченный участник)",
-        quote_content=target_msg.content.strip(),
+        quote_content=quote_content,
         category="Правосудие",
         tier_name="High",
         win_pct=t_cfg["win_pct"],
@@ -2884,7 +2956,9 @@ async def rappeal(interaction: discord.Interaction, message_id: str):
         target_message_id=target_msg.id,
         target_user_id=interaction.user.id,
         protect_from_02=True,
-        destination_channel_id=APPEALS_CHANNEL_ID
+        destination_channel_id=APPEALS_CHANNEL_ID,
+        attachments_meta=att_meta,
+        cloned_files=cloned_files
     )
 
     if poll_msg:
