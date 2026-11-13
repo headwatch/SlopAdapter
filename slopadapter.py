@@ -18,7 +18,7 @@ from typing import Optional, Dict, Any, List, Tuple, Set
 # 1. GLOBAL CONFIGURATION & PERMISSION MATRIX
 # =====================================================================
 
-BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+BOT_TOKEN = "YOUR_TOKEN"
 PROXY_URL = None
 
 # Authorized Platform ID (Discord Server ID).
@@ -168,7 +168,7 @@ DASHBOARD_CACHE: Optional[Dict[str, Any]] = None
 MESSAGE_LOG_BUFFER: List[Tuple[int, int, float]] = []
 buffer_lock = asyncio.Lock()
 
-ACTIVE_STATS_CACHE: Dict[int, Tuple[float, int, float, List[Tuple[int, int]]]] = {}
+ACTIVE_STATS_CACHE: Dict[int, Tuple[float, int, float, List[Tuple[int, float]]]] = {}
 ACTIVE_STATS_TTL = 30.0
 
 intents = discord.Intents.default()
@@ -334,7 +334,7 @@ def ensure_sample_election_template() -> None:
             '        "2. Был ли у вас опыт модерации и работы со Стандартом ACI?",\n'
             '        "3. Как вы поступите, если другой Управленец нарушит п. 4.3 (скрытая модерация)?",\n'
             '        "4. В каких случаях допустимо применение Изоляции (п. 3.5)?",\n'
-            '        "5. Почему ваша деятельность не приведёт к злоупотреблению привилегиями (Раздел 4)?",\n'
+            '        "5. Почему ваша деятельность не приведёт к злоупотреблению привилегии (Раздел 4)?",\n'
             '        "6. Опишите, как работает перекрёстный контроль валидации (п. 3.3.1).",\n'
             '        "7. Ваша главная цель на посту Управленца в ближайший месяц?"\n'
             '    ]\n'
@@ -590,8 +590,8 @@ async def check_full_member_status(member: discord.Member) -> Tuple[bool, str]:
     return True, ""
 
 
-async def get_active_users_stats(guild_id: int) -> Tuple[int, float, List[Tuple[int, int]]]:
-    """Calculates 30-day activity median and active user count for the Platform (Rule 6.7)."""
+async def get_active_users_stats(guild_id: int) -> Tuple[int, float, List[Tuple[int, float]]]:
+    """Calculates 30-day activity index, 50% median threshold, and active users (Rule 6.7 & SVA V. RH)."""
     if not is_authorized_platform(guild_id):
         return 0, 0.0, []
 
@@ -606,11 +606,9 @@ async def get_active_users_stats(guild_id: int) -> Tuple[int, float, List[Tuple[
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute(
-                '''SELECT user_id, COUNT(*) as msg_count 
+                '''SELECT user_id, timestamp 
                    FROM message_logs 
-                   WHERE guild_id = ? AND timestamp >= ? 
-                   GROUP BY user_id 
-                   ORDER BY msg_count DESC''',
+                   WHERE guild_id = ? AND timestamp >= ?''',
                 (guild_id, thirty_days_ago)
             ) as cursor:
                 results = await cursor.fetchall()
@@ -619,13 +617,47 @@ async def get_active_users_stats(guild_id: int) -> Tuple[int, float, List[Tuple[
             ACTIVE_STATS_CACHE[guild_id] = (now, 0, 0.0, [])
             return 0, 0.0, []
 
-        counts = [row[1] for row in results if row[1] > 0]
-        if not counts:
+        # Map each message into one of 2880 fixed 15-minute intervals (30 days * 96 slots)
+        user_slots: Dict[int, Set[int]] = {}
+        for uid, ts in results:
+            slot = int((float(ts) - thirty_days_ago) // 900.0)
+            if slot < 0:
+                slot = 0
+            elif slot >= 2880:
+                slot = 2879
+            user_id_int = int(uid)
+            if user_id_int not in user_slots:
+                user_slots[user_id_int] = set()
+            user_slots[user_id_int].add(slot)
+
+        user_indices: List[Tuple[int, float]] = []
+        for uid, slots in user_slots.items():
+            day_impulses: Dict[int, int] = {}
+            for slot in slots:
+                day_num = (slot // 96) + 1  # 1 (oldest 24h) to 30 (last 24h)
+                day_impulses[day_num] = day_impulses.get(day_num, 0) + 1
+
+            # Discard users with impulses in fewer than 2 distinct days out of 30
+            if len(day_impulses) < 2:
+                continue
+
+            total_index = 0.0
+            for day_num, impulses in day_impulses.items():
+                freshness_weight = 0.5 + 0.5 * (day_num / 30.0)
+                total_index += math.log(1.0 + impulses) * freshness_weight
+
+            user_indices.append((uid, total_index))
+
+        if not user_indices:
             ACTIVE_STATS_CACHE[guild_id] = (now, 0, 0.0, [])
             return 0, 0.0, []
 
-        threshold = float(statistics.median(counts))
-        active_users = [(int(row[0]), int(row[1])) for row in results if row[1] >= threshold]
+        user_indices.sort(key=lambda x: x[1], reverse=True)
+        sorted_scores = [score for _, score in user_indices]
+        median_score = float(statistics.median(sorted_scores))
+        threshold = 0.5 * median_score
+
+        active_users = [(uid, score) for uid, score in user_indices if score >= threshold]
         active_len = len(active_users)
         ACTIVE_STATS_CACHE[guild_id] = (now, active_len, threshold, active_users)
         return active_len, threshold, active_users
@@ -1880,7 +1912,7 @@ async def generate_statistics_embed(guild: discord.Guild, interval: int) -> disc
         name="👥 База активности (30 дней, п. 6.7)",
         value=(
             f"┏ **Активных участников:** `{active_count} чел.`\n"
-            f"┃ **Порог медианы:** `{median_threshold:g} сообщ.`\n"
+            f"┃ **Порог (50% медианы):** `{median_threshold:.2f}`\n"
             f"┗ **В Изоляции (п. 3.5):** `{isolated_count} чел.`"
         ),
         inline=True
@@ -3250,14 +3282,14 @@ async def ractivelist(interaction: discord.Interaction):
     if not active_users:
         return await interaction.followup.send("📊 За последние 30 дней нет данных об активности.")
 
-    top_display = [f"**{idx}.** <@{uid}> — `{count}` сообщ." for idx, (uid, count) in enumerate(active_users[:15], 1)]
+    top_display = [f"**{idx}.** <@{uid}> — индекс `{score:.2f}`" for idx, (uid, score) in enumerate(active_users[:15], 1)]
     if len(active_users) > 15:
         top_display.append(f"\n*...и ещё {len(active_users) - 15} активных участников на Площадке.*")
 
     embed = discord.Embed(
         title="👥 База расчёта динамического кворума (за 30 дней, п. 6.7)",
         description=(
-            f"**Порог активности (медиана):** `{threshold:g} сообщ.`\n"
+            f"**Порог активности (50% медианы):** `{threshold:.2f}`\n"
             f"**Активных участников Площадки (100% базы кворума):** `{active_count} чел.`\n\n"
             f"**Топ активности:**\n" + "\n".join(top_display)
         ),
