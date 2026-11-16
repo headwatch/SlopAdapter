@@ -1,7 +1,3 @@
-"""
-ASU Horizon — SVA V. RH Local Single-Guild Discord Bot (discord.py 2.x)
-"""
-
 import datetime
 import hashlib
 import io
@@ -30,28 +26,26 @@ ALLOWED_GUILD_ID: int = int(os.getenv("ALLOWED_GUILD_ID", "123456789012345678"))
 
 # Core role IDs
 FULL_MEMBER_ROLE_ID: int = int(os.getenv("FULL_MEMBER_ROLE_ID", "111111111111111111"))
-RESTRICTED_ROLE_ID: int = int(os.getenv("RESTRICTED_ROLE_ID", "333333333333333333"))
-TWINK_ROLE_ID: int = int(os.getenv("TWINK_ROLE_ID", "0"))
+RESTRICTED_ROLE_ID: int = int(os.getenv("RESTRICTED_ROLE_ID", "222222222222222222"))
+TWINK_ROLE_ID: int = int(os.getenv("TWINK_ROLE_ID", "000000000000000000"))
 
 # Manager role registry: add any number (N) of roles here as {ROLE_ID: "Role Title"}
 MANAGER_ROLES: Dict[int, str] = {
-    111111111111111111: "Младший модератор",
-    222222222222222222: "Модератор",
-    333333333333333333: "Старший модератор",
-    444444444444444444: "Технический администратор",
-    555555555555555555: "Главный администратор",
+    222222222222222222: "Mod",
+    333333333333333333: "Admin",
 }
 
 # Leave list empty [] to allow all MANAGER_ROLES, or specify any combination of Role IDs per action
 COMMAND_PERMISSIONS: Dict[str, List[int]] = {
-    "aci_confirm":   [222222222222222222, 333333333333333333, 555555555555555555],
-    "aci_reject":    [222222222222222222, 333333333333333333, 555555555555555555],
-    "isolate":       [111111111111111111, 222222222222222222, 333333333333333333, 555555555555555555],
-    "unisolate":     [222222222222222222, 333333333333333333, 555555555555555555],
-    "ban_twink":     [333333333333333333, 555555555555555555],
-    "approve_twink": [444444444444444444, 555555555555555555],
-    "appoint":       [555555555555555555],
-    "unexecutable":  [444444444444444444, 555555555555555555],
+    "aci_confirm":     [222222222222222222, 333333333333333333],
+    "aci_reject":      [222222222222222222, 333333333333333333],
+    "isolate":         [222222222222222222, 333333333333333333],
+    "unisolate":       [222222222222222222, 333333333333333333],
+    "ban_twink":       [222222222222222222, 333333333333333333],
+    "approve_twink":   [222222222222222222, 333333333333333333],
+    "unapprove_twink": [222222222222222222, 333333333333333333],
+    "appoint":         [222222222222222222, 333333333333333333],
+    "unexecutable":    [222222222222222222, 333333333333333333],
 }
 
 # Core channel IDs
@@ -364,13 +358,22 @@ class HorizonDatabase:
             )
             conn.commit()
 
-    def register_approved_twink(self, twink_id: int, owner_id: int, poll_id: int) -> None:
+    def register_approved_twink(self, twink_id: int, owner_id: int, poll_id: Optional[int] = None) -> None:
         with self._get_conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO approved_twinks (twink_user_id, owner_user_id, poll_id, approved_at) VALUES (?, ?, ?, ?)",
-                (twink_id, owner_id, poll_id, time.time()),
+                (twink_id, owner_id, poll_id or 0, time.time()),
             )
             conn.commit()
+
+    def remove_approved_twink(self, twink_id: int) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM approved_twinks WHERE twink_user_id = ?",
+                (twink_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
 
     def get_approved_twink_owner(self, user_id: int) -> Optional[int]:
         with self._get_conn() as conn:
@@ -1115,10 +1118,105 @@ class ACIValidationModal(discord.ui.Modal):
         )
 
 
+class PersonalACIView(discord.ui.View):
+    def __init__(self, bot: "HorizonBot", poll: sqlite3.Row, member: discord.Member):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.poll_id = int(poll["poll_id"])
+
+        poll_open = poll["status"] in ("COOLDOWN", "ACTIVE") and not bool(poll["aci_immune"])
+        is_target = poll["target_user_id"] == member.id
+        is_initiator = poll["initiator_id"] == member.id
+
+        can_confirm = (
+            poll_open
+            and has_command_permission(member, "aci_confirm")
+            and not is_target
+            and not is_initiator
+        )
+        can_reject = (
+            poll_open
+            and has_command_permission(member, "aci_reject")
+            and not is_target
+        )
+
+        self.aci_confirm_btn.disabled = not can_confirm
+        self.aci_confirm_btn.style = (
+            discord.ButtonStyle.success if can_confirm else discord.ButtonStyle.secondary
+        )
+
+        self.aci_reject_btn.disabled = not can_reject
+        self.aci_reject_btn.style = (
+            discord.ButtonStyle.danger if can_reject else discord.ButtonStyle.secondary
+        )
+
+    @discord.ui.button(label="☑️ ACI (+)", style=discord.ButtonStyle.success, row=0)
+    async def aci_confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not isinstance(interaction.user, discord.Member) or not has_command_permission(interaction.user, "aci_confirm"):
+            await interaction.response.send_message(
+                "❌ У вашей должности нет прав на подтверждение голосований по ACI (`aci_confirm`).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(ACIValidationModal(self.bot, self.poll_id, +1))
+
+    @discord.ui.button(label="🚫 ACI (-)", style=discord.ButtonStyle.danger, row=0)
+    async def aci_reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not isinstance(interaction.user, discord.Member) or not has_command_permission(interaction.user, "aci_reject"):
+            await interaction.response.send_message(
+                "❌ У вашей должности нет прав на отклонение голосований по ACI (`aci_reject`).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(ACIValidationModal(self.bot, self.poll_id, -1))
+
+
 class PersistentPollView(discord.ui.View):
-    def __init__(self, bot: "HorizonBot"):
+    def __init__(self, bot: "HorizonBot", poll: Optional[sqlite3.Row] = None):
         super().__init__(timeout=None)
         self.bot = bot
+        if poll is not None:
+            self._apply_poll_state(poll)
+
+    def _apply_poll_state(self, poll: sqlite3.Row) -> None:
+        status = poll["status"]
+        aci_immune = bool(poll["aci_immune"])
+        vote_buttons = (
+            self.vote_plus_2,
+            self.vote_plus_1,
+            self.vote_zero,
+            self.vote_minus_1,
+            self.vote_minus_2,
+        )
+
+        if status == "COOLDOWN":
+            for btn in vote_buttons:
+                btn.disabled = True
+                btn.style = discord.ButtonStyle.secondary
+            self.check_my_vote_and_aci.disabled = True
+            self.check_my_vote_and_aci.style = discord.ButtonStyle.secondary
+        elif status == "ACTIVE":
+            for btn in vote_buttons:
+                btn.disabled = False
+            self.vote_plus_2.style = discord.ButtonStyle.success
+            self.vote_plus_1.style = discord.ButtonStyle.success
+            self.vote_zero.style = discord.ButtonStyle.secondary
+            self.vote_minus_1.style = discord.ButtonStyle.danger
+            self.vote_minus_2.style = discord.ButtonStyle.danger
+            self.check_my_vote_and_aci.disabled = False
+            self.check_my_vote_and_aci.style = discord.ButtonStyle.primary
+        else:
+            for btn in vote_buttons:
+                btn.disabled = True
+                btn.style = discord.ButtonStyle.secondary
+            self.check_my_vote_and_aci.disabled = False
+            self.check_my_vote_and_aci.style = discord.ButtonStyle.primary
+
+        aci_disabled = aci_immune or status not in ("COOLDOWN", "ACTIVE")
+        self.aci_report_btn.disabled = aci_disabled
+        self.aci_report_btn.style = discord.ButtonStyle.secondary
+        self.aci_panel_btn.disabled = aci_immune
+        self.aci_panel_btn.style = discord.ButtonStyle.secondary
 
     async def _handle_likert_vote(self, interaction: discord.Interaction, weight: int, label: str) -> None:
         if not verify_guild(interaction) or not isinstance(interaction.user, discord.Member):
@@ -1242,33 +1340,39 @@ class PersistentPollView(discord.ui.View):
             return
         await interaction.response.send_modal(ACIReportModal(self.bot, poll["poll_id"], interaction.message.jump_url))
 
-    @discord.ui.button(label="☑️ ACI (+)", style=discord.ButtonStyle.secondary, custom_id="sva_rh:aci:confirm", row=1)
-    async def aci_confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not isinstance(interaction.user, discord.Member) or not has_command_permission(interaction.user, "aci_confirm"):
-            await interaction.response.send_message(
-                "❌ У вашей должности нет прав на подтверждение голосований по ACI (`aci_confirm`).",
-                ephemeral=True,
-            )
+    @discord.ui.button(label="⚖️ Панель ACI", style=discord.ButtonStyle.secondary, custom_id="sva_rh:aci:panel", row=1)
+    async def aci_panel_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not verify_guild(interaction) or not isinstance(interaction.user, discord.Member):
             return
-        poll = self.bot.get_poll_by_message(interaction.message.id)
-        if not poll:
-            await interaction.response.send_message("❌ Голосование не найдено.", ephemeral=True)
-            return
-        await interaction.response.send_modal(ACIValidationModal(self.bot, poll["poll_id"], +1))
 
-    @discord.ui.button(label="🚫 ACI (-)", style=discord.ButtonStyle.secondary, custom_id="sva_rh:aci:reject", row=1)
-    async def aci_reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not isinstance(interaction.user, discord.Member) or not has_command_permission(interaction.user, "aci_reject"):
-            await interaction.response.send_message(
-                "❌ У вашей должности нет прав на отклонение голосований по ACI (`aci_reject`).",
-                ephemeral=True,
-            )
-            return
         poll = self.bot.get_poll_by_message(interaction.message.id)
         if not poll:
             await interaction.response.send_message("❌ Голосование не найдено.", ephemeral=True)
             return
-        await interaction.response.send_modal(ACIValidationModal(self.bot, poll["poll_id"], -1))
+
+        aci = self.bot.db.get_aci_summary(poll["poll_id"])
+        cur_weight = self.bot.db.compute_aci_manager_weight(poll["voting_starts_at"], poll["ends_at"])
+
+        if not aci["records"]:
+            aci_lines = "Оценок Управленцев по ACI пока нет (`0.00`)."
+        else:
+            lines = []
+            for r in aci["records"]:
+                sign_icon = "✅" if r["verdict"] > 0 else "❌"
+                lines.append(
+                    f"{sign_icon} <@{r['manager_id']}> (`{r['effective_weight']:+.3f}`): *{r['reason']}*"
+                )
+            aci_lines = "\n".join(lines)
+
+        personal_view = PersonalACIView(self.bot, poll, interaction.user)
+        await interaction.response.send_message(
+            f"### ⚖️ Панель валидации ACI │ Голосование #{poll['poll_id']}\n"
+            f"• **Текущий баланс ACI:** `{aci['balance']:+.4f}` (порог отмены: `<= -0.50`)\n"
+            f"• **Вес новой оценки в данный момент:** `±{cur_weight:.4f}`\n\n"
+            f"**Журнал оценок Управленцев (п. 4.3, 6.2):**\n{aci_lines}",
+            view=personal_view,
+            ephemeral=True,
+        )
 
 
 class NextQuestionnairePartView(discord.ui.View):
@@ -1529,14 +1633,13 @@ class HorizonBot(commands.Bot):
         try:
             msg = await channel.fetch_message(poll["message_id"])
             embed = build_poll_embed(self.db, poll, guild)
+            view = PersistentPollView(self, poll)
             if disable_buttons:
-                view = PersistentPollView(self)
                 for item in view.children:
                     if isinstance(item, discord.ui.Button) and item.custom_id != "sva_rh:info":
                         item.disabled = True
-                await msg.edit(embed=embed, view=view)
-            else:
-                await msg.edit(embed=embed)
+                        item.style = discord.ButtonStyle.secondary
+            await msg.edit(embed=embed, view=view)
         except Exception as exc:
             logger.debug(f"Could not update poll message #{poll['poll_id']}: {exc}")
 
@@ -1608,7 +1711,7 @@ class HorizonBot(commands.Bot):
         poll = self.db.get_poll(poll_id)
 
         embed = build_poll_embed(self.db, poll, guild)
-        view = PersistentPollView(self)
+        view = PersistentPollView(self, poll)
         if last_sent_msg:
             msg = await target_channel.send(embed=embed, view=view, reference=last_sent_msg)
         else:
@@ -2779,15 +2882,18 @@ async def cmd_unexecutable(
 
 @bot.tree.command(
     name="approve_twink",
-    description="Пункт 2.6: Внести одобренный голосованием технический аккаунт в реестр без права голоса",
+    description="Пункт 2.6: Внести технический аккаунт в реестр без права голоса",
 )
 @app_commands.describe(
     twink_user="Технический/проектный дополнительный аккаунт",
     owner_user="Основной аккаунт владельца",
-    poll_id="Номер успешного голосования Сообщества, одобрившего аккаунт (п. 2.6)",
+    poll_id="Номер голосования, одобрившего аккаунт (необязательно)",
 )
 async def cmd_approve_twink(
-    interaction: discord.Interaction, twink_user: discord.Member, owner_user: discord.Member, poll_id: int
+    interaction: discord.Interaction,
+    twink_user: discord.Member,
+    owner_user: discord.Member,
+    poll_id: Optional[int] = None,
 ) -> None:
     if not verify_guild(interaction) or not isinstance(interaction.user, discord.Member):
         return
@@ -2796,19 +2902,21 @@ async def cmd_approve_twink(
         await interaction.response.send_message("❌ У вашей должности нет прав на выполнение `/approve_twink`.", ephemeral=True)
         return
 
-    poll = bot.db.get_poll(poll_id)
-    if not poll or poll["status"] != "PASSED":
-        await interaction.response.send_message(
-            f"❌ Голосование `#{poll_id}` не найдено или не завершилось победой (`PASSED`).", ephemeral=True
-        )
-        return
+    poll_info_str = "Без привязки к голосованию (прямое решение Управленца)"
+    if poll_id is not None:
+        poll = bot.db.get_poll(poll_id)
+        if poll:
+            poll_info_str = f"`#{poll_id}` (`[{poll['category']}]`, статус: `{poll['status']}`)"
+        else:
+            poll_info_str = f"`#{poll_id}` (указан вручную)"
 
     bot.db.register_approved_twink(twink_user.id, owner_user.id, poll_id)
     if TWINK_ROLE_ID > 0 and interaction.guild:
         twink_role = interaction.guild.get_role(TWINK_ROLE_ID)
         if twink_role and twink_role not in twink_user.roles:
             try:
-                await twink_user.add_roles(twink_role, reason=f"АСУ п. 2.6: Одобрено голосованием #{poll_id}")
+                reason_suffix = f" (голосование #{poll_id})" if poll_id is not None else ""
+                await twink_user.add_roles(twink_role, reason=f"АСУ п. 2.6: Технический аккаунт{reason_suffix}")
             except Exception:
                 pass
 
@@ -2823,13 +2931,75 @@ async def cmd_approve_twink(
         description=(
             f"**Технический аккаунт:** {twink_user.mention} (`{twink_user.id}`)\n"
             f"**Владелец:** {owner_user.mention} (`{owner_user.id}`)\n"
-            f"**Одобрено голосованием:** `#{poll_id}`\n"
+            f"**Голосование-основание:** {poll_info_str}\n"
             f"**Внёс в реестр:** {interaction.user.mention}"
         ),
         color=0x1ABC9C,
     )
     await interaction.response.send_message(
-        f"✅ Аккаунт {twink_user.mention} внесён в реестр технических аккаунтов без права голоса (владелец: {owner_user.mention}).",
+        f"✅ Аккаунт {twink_user.mention} внесён в реестр технических аккаунтов без права голоса "
+        f"(владелец: {owner_user.mention}, основание: {poll_info_str}).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="unapprove_twink",
+    description="Пункт 2.6: Снять с пользователя статус технического аккаунта (твинка) и вернуть право голоса",
+)
+@app_commands.describe(
+    twink_user="Аккаунт, с которого снимается статус технического твинка",
+    reason="Причина снятия статуса технического аккаунта (п. 4.3)",
+)
+async def cmd_unapprove_twink(
+    interaction: discord.Interaction,
+    twink_user: discord.Member,
+    reason: str = "Снятие статуса технического аккаунта",
+) -> None:
+    if not verify_guild(interaction) or not isinstance(interaction.user, discord.Member):
+        return
+
+    if not (
+        has_command_permission(interaction.user, "unapprove_twink")
+        or has_command_permission(interaction.user, "approve_twink")
+    ):
+        await interaction.response.send_message(
+            "❌ У вашей должности нет прав на выполнение `/unapprove_twink`.", ephemeral=True
+        )
+        return
+
+    was_in_db = bot.db.remove_approved_twink(twink_user.id)
+    role_removed = False
+
+    if TWINK_ROLE_ID > 0 and interaction.guild:
+        twink_role = interaction.guild.get_role(TWINK_ROLE_ID)
+        if twink_role and twink_role in twink_user.roles:
+            try:
+                await twink_user.remove_roles(
+                    twink_role, reason=f"АСУ п. 2.6: Снятие статуса тех. аккаунта ({interaction.user}): {reason}"
+                )
+                role_removed = True
+            except Exception:
+                pass
+
+    if not was_in_db and not role_removed:
+        await interaction.response.send_message(
+            f"ℹ️ У пользователя {twink_user.mention} не было статуса или роли технического аккаунта.",
+            ephemeral=True,
+        )
+        return
+
+    await bot.log_audit_event(
+        title="🔓 Снят статус технического аккаунта (/unapprove_twink │ п. 2.6)",
+        description=(
+            f"**Аккаунт:** {twink_user.mention} (`{twink_user.id}`)\n"
+            f"**Управленец:** {interaction.user.mention}\n"
+            f"**Причина (п. 4.3):** {reason.strip()}"
+        ),
+        color=0x2ECC71,
+    )
+    await interaction.response.send_message(
+        f"✅ С аккаунта {twink_user.mention} снят статус технического твинка.",
         ephemeral=True,
     )
 
@@ -2975,11 +3145,11 @@ async def cmd_activelist(interaction: discord.Interaction) -> None:
 )
 async def cmd_help(interaction: discord.Interaction) -> None:
     help_text = (
-        "### 🗳️ Кнопки голосования (Шкала Лайкерта и ACI)\n"
-        "• `⏫ (+2)` / `🔼 (+1)` / `⏺️ (0)` / `🔽 (-1)` / `⏬ (-2)` — ваш голос (скрыт от других по п. 6.3).\n"
+        "### 🗳️ Кнопки голосования\n"
+        "• `⏫ (+2)` / `🔼 (+1)` / `⏺️ (0)` / `🔽 (-1)` / `⏬ (-2)` — веса голосов.\n"
         "• `🔍 Мой голос` — проверить свой сохранённый голос и лог оценок Управленцев по ACI.\n"
         "• `🚩 Жалоба ACI` — отправить наводку Управленцам на нарушение стандарта ACI.\n"
-        "• `☑️ ACI (+)` / `🚫 ACI (-)` — вердикт Управленца с защитой от таймснайпинга (отмена при `<= -0.5`).\n\n"
+        "• `⚖️ Панель ACI` — открыть окно валидации ACI.\n\n"
         "### 📊 Запуск голосований (Разделы 1, 6, 7)\n"
         "• `/poll <category> <message_ids>` — создать голосование по 1 или нескольким ID/ссылкам сообщений («бургер»).\n"
         "• `/poll_impeach <@manager>` — голосование за снятие Управленца в обход ACI с полным иммунитетом (п. 6.8).\n"
@@ -2994,7 +3164,8 @@ async def cmd_help(interaction: discord.Interaction) -> None:
         "• `/appoint <@user> <@role> <reason>` — выдать роль Управленца с задержкой 30 минут (лимит 3/24ч).\n"
         "• `/selfimpeach <@role>` — добровольно сложить полномочия Управленца (п. 7.3).\n"
         "• `/unexecutable <poll_id> <clause> <proof>` — мотивированный отказ по неисполнимости (п. 6.10 / 6.10.1).\n"
-        "• `/approve_twink <@twink> <@owner> <poll_id>` — внести одобренный тех. аккаунт в реестр без права голоса (п. 2.6)."
+        "• `/approve_twink <@twink> <@owner> [poll_id]` — внести тех. аккаунт в реестр без права голоса (п. 2.6).\n"
+        "• `/unapprove_twink <@twink> [reason]` — снять статус технического аккаунта (п. 2.6)."
     )
     embed = discord.Embed(
         title="ℹ️ Документация АСУ «Горизонт» (SVA V. RH)",
