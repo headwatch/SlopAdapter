@@ -336,6 +336,16 @@ class HorizonDatabase:
             """)
 
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS aci_reports (
+                    poll_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    reported_at REAL NOT NULL,
+                    PRIMARY KEY (poll_id, user_id)
+                )
+            """)
+
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS isolations (
                     user_id INTEGER PRIMARY KEY,
                     manager_id INTEGER NOT NULL,
@@ -866,6 +876,34 @@ class HorizonDatabase:
             "records": rows,
         }
 
+    def has_user_reported_aci(self, poll_id: int, user_id: int) -> bool:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM aci_reports WHERE poll_id = ? AND user_id = ?",
+                (poll_id, user_id),
+            ).fetchone()
+            return row is not None
+
+    def record_aci_report(self, poll_id: int, user_id: int, reason: str) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO aci_reports (poll_id, user_id, reason, reported_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (poll_id, user_id, reason.strip(), time.time()),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_aci_reports_count(self, poll_id: int) -> int:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM aci_reports WHERE poll_id = ?",
+                (poll_id,),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+
 
 # =============================================================================
 # PERMISSION HELPERS & EMBED BUILDER
@@ -1113,12 +1151,18 @@ def build_poll_embed(db: HorizonDatabase, poll: sqlite3.Row, guild: Optional[dis
 
     embed.add_field(name="📈 Ход и итоги голосования", value=voting_progress_text, inline=False)
 
+    aci_field_value = (
+        f"• **Состояние:** {aci_status_str}\n"
+        f"• **Оценок Управленцев:** `{aci['count']}` (порог отмены: `<= -0.50`)"
+    )
+    if not poll["aci_immune"]:
+        reports_count = db.get_aci_reports_count(poll["poll_id"])
+        reports_indicator = f"🚩 **`{reports_count}`**" if reports_count > 0 else "`0`"
+        aci_field_value += f"\n• **Жалоб по ACI:** {reports_indicator}"
+
     embed.add_field(
         name="🔍 Валидация по Стандарту ACI (п. 3.3, 6.2, 6.5)",
-        value=(
-            f"• **Состояние:** {aci_status_str}\n"
-            f"• **Оценок Управленцев:** `{aci['count']}` (порог отмены: `<= -0.50`)"
-        ),
+        value=aci_field_value,
         inline=False,
     )
 
@@ -1169,12 +1213,40 @@ class ACIReportModal(discord.ui.Modal, title="🚩 Жалоба на прове�
         if not verify_guild(interaction):
             return
 
+        poll = self.bot.db.get_poll(self.poll_id)
+        if not poll or poll["status"] not in ("COOLDOWN", "ACTIVE"):
+            await interaction.response.send_message("❌ Голосование уже завершено.", ephemeral=True)
+            return
+
+        if poll["aci_immune"]:
+            await interaction.response.send_message(
+                "🛡️ Это специальное голосование по п. 6.8 Регламента — оно обладает полным иммунитетом к ACI.",
+                ephemeral=True,
+            )
+            return
+
+        recorded = self.bot.db.record_aci_report(
+            self.poll_id, interaction.user.id, self.violation_details.value
+        )
+        if not recorded:
+            await interaction.response.send_message(
+                "⚠️ Вы уже отправляли жалобу по Стандарту ACI на это голосование. Допускается не более одной жалобы от одного пользователя.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
+        reports_count = self.bot.db.get_aci_reports_count(self.poll_id)
+        updated_poll = self.bot.db.get_poll(self.poll_id)
+        if updated_poll:
+            await self.bot.refresh_poll_message(updated_poll)
+
         await self.bot.log_audit_event(
             title=f"🚩 Запрос на проверку ACI │ Голосование #{self.poll_id}",
             description=(
                 f"**Голосование:** [Перейти к карточке #{self.poll_id}]({self.jump_url})\n"
-                f"**Заявитель:** {interaction.user.mention} (`{interaction.user.id}`)\n\n"
+                f"**Заявитель:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+                f"**Всего жалоб на голосование:** `{reports_count}`\n\n"
                 f"**Суть жалобы по Стандарту ACI (п. 6.2):**\n"
                 f"> {self.violation_details.value.strip()}\n\n"
                 f"*Управленцы могут вынести вердикт кнопками `☑️ ACI (+)` / `🚫 ACI (-)` под голосованием.*"
@@ -1377,6 +1449,11 @@ class PersistentPollView(discord.ui.View):
         aci_disabled = aci_immune or status not in ("COOLDOWN", "ACTIVE")
         self.aci_report_btn.disabled = aci_disabled
         self.aci_report_btn.style = discord.ButtonStyle.secondary
+        if not aci_immune:
+            reports_count = self.bot.db.get_aci_reports_count(poll["poll_id"])
+            self.aci_report_btn.label = f"🚩 Жалоба ACI ({reports_count})"
+        else:
+            self.aci_report_btn.label = "🚩 Жалоба ACI"
         self.aci_panel_btn.disabled = aci_immune
         self.aci_panel_btn.style = discord.ButtonStyle.secondary
 
@@ -1502,6 +1579,12 @@ class PersistentPollView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if self.bot.db.has_user_reported_aci(poll["poll_id"], interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ Вы уже отправляли жалобу по Стандарту ACI на это голосование. Допускается не более одной жалобы от одного пользователя.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_modal(ACIReportModal(self.bot, poll["poll_id"], interaction.message.jump_url))
 
     @discord.ui.button(label="⚖️ Панель ACI", style=discord.ButtonStyle.secondary, custom_id="sva_rh:aci:panel", row=1)
@@ -1528,11 +1611,18 @@ class PersistentPollView(discord.ui.View):
                 )
             aci_lines = "\n".join(lines)
 
+        reports_line = (
+            f"• **Жалоб по ACI:** `{self.bot.db.get_aci_reports_count(poll['poll_id'])}`\n"
+            if not poll["aci_immune"]
+            else ""
+        )
+
         personal_view = PersonalACIView(self.bot, poll, interaction.user)
         await interaction.response.send_message(
             f"### ⚖️ Панель валидации ACI │ Голосование #{poll['poll_id']}\n"
             f"• **Текущий баланс ACI:** `{aci['balance']:+.4f}` (порог отмены: `<= -0.50`)\n"
-            f"• **Вес новой оценки в данный момент:** `±{cur_weight:.4f}`\n\n"
+            f"• **Вес новой оценки в данный момент:** `±{cur_weight:.4f}`\n"
+            f"{reports_line}\n"
             f"**Журнал оценок Управленцев (п. 4.3, 6.2):**\n{aci_lines}",
             view=personal_view,
             ephemeral=True,
@@ -3434,6 +3524,10 @@ async def cmd_poll_list(interaction: discord.Interaction) -> None:
         tallies = bot.db.calculate_poll_tallies(p["poll_id"])
         icon = "🧊" if p["status"] == "COOLDOWN" else "🗳️"
         shield = " 🛡️" if p["aci_immune"] else ""
+        reports_part = ""
+        if not p["aci_immune"]:
+            rep_cnt = bot.db.get_aci_reports_count(p["poll_id"])
+            reports_part = f" │ 🚩 Жалоб: **`{rep_cnt}`**"
         jump_url = (
             f"https://discord.com/channels/{interaction.guild.id}/{p['channel_id']}/{p['message_id']}"
             if p["channel_id"] and p["message_id"]
@@ -3444,7 +3538,7 @@ async def cmd_poll_list(interaction: discord.Interaction) -> None:
         lines.append(
             f"**{idx}.** {icon}{shield} {title_link}\n"
             f"> *{short_text}*\n"
-            f"Явка: **`{tallies['total_voters']}/{req_q}`** │ Завершение: <t:{int(p['ends_at'])}:R>"
+            f"Явка: **`{tallies['total_voters']}/{req_q}`**{reports_part} │ Завершение: <t:{int(p['ends_at'])}:R>"
         )
 
     embed = discord.Embed(
