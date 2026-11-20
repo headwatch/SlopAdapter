@@ -23,29 +23,31 @@ BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
 
 # Strict single-guild lock: bot automatically leaves any other guild
 ALLOWED_GUILD_ID: int = int(os.getenv("ALLOWED_GUILD_ID", "123456789012345678"))
+GUILD_OBJECT: discord.Object = discord.Object(id=ALLOWED_GUILD_ID)
 
 # Core role IDs
 FULL_MEMBER_ROLE_ID: int = int(os.getenv("FULL_MEMBER_ROLE_ID", "111111111111111111"))
 RESTRICTED_ROLE_ID: int = int(os.getenv("RESTRICTED_ROLE_ID", "222222222222222222"))
 TWINK_ROLE_ID: int = int(os.getenv("TWINK_ROLE_ID", "000000000000000000"))
 
-# Manager role registry: add any number (N) of roles here as {ROLE_ID: "Role Title"}
+# Manager role registry: {ROLE_ID: "Role Title"}
 MANAGER_ROLES: Dict[int, str] = {
     222222222222222222: "Mod",
     333333333333333333: "Admin",
 }
 
-# Leave list empty [] to allow all MANAGER_ROLES, or specify any combination of Role IDs per action
+# Leave list empty [] to allow all MANAGER_ROLES, or specify Role IDs per action
 COMMAND_PERMISSIONS: Dict[str, List[int]] = {
     "aci_confirm":     [222222222222222222, 333333333333333333],
     "aci_reject":      [222222222222222222, 333333333333333333],
     "isolate":         [222222222222222222, 333333333333333333],
     "unisolate":       [222222222222222222, 333333333333333333],
-    "ban_twink":       [222222222222222222, 333333333333333333],
+    "kick_twink":      [222222222222222222, 333333333333333333],
     "approve_twink":   [222222222222222222, 333333333333333333],
     "unapprove_twink": [222222222222222222, 333333333333333333],
     "appoint":         [222222222222222222, 333333333333333333],
     "unexecutable":    [222222222222222222, 333333333333333333],
+    "sync":            [333333333333333333],
 }
 
 # Core channel IDs
@@ -59,12 +61,13 @@ ELECTIONS_DIR: str = os.path.join(BASE_DIR, "elections_jsons")
 # Security limits & constants
 DAILY_ISOLATE_LIMIT: int = 3
 DAILY_APPOINT_LIMIT: int = 3
-DAILY_BAN_TWINK_LIMIT: int = 1
+DAILY_KICK_TWINK_LIMIT: int = 1
+POLL_CREATE_COOLDOWN_SECONDS: int = 30
 APPOINT_DELAY_SECONDS: int = 1800
 DISCORD_MAX_TIMEOUT_SECONDS: int = 2419200
 MAX_ATTACHMENT_BYTES: int = 8 * 1024 * 1024
 
-# Timer multiplier (1.0 = production SVA V. RH timers; e.g. 0.01 = 100x faster for testing)
+# Timer multiplier (1.0 = production SVA V. RH timers)
 TIME_SCALE: float = 1.0
 
 DURATION_UNITS: Dict[str, int] = {
@@ -77,7 +80,9 @@ DURATION_UNITS: Dict[str, int] = {
 }
 DURATION_TOKEN_RE = re.compile(r"(\d+)\s*(sec|min|mon|day|hr|mo|yr|s|h|d|m|y)\b")
 WHITESPACE_RE = re.compile(r"\s+")
-SNOWFLAKE_RE = re.compile(r"\d{15,22}")
+MESSAGE_REF_RE = re.compile(
+    r"(?:https?://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/\d+/(\d+)/(\d+))|(?<!\d)(\d{15,22})(?!\d)"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -169,6 +174,17 @@ def parse_duration_string(duration_str: str) -> Optional[int]:
     if WHITESPACE_RE.sub("", cleaned) != reconstructed:
         return None
     return sum(int(val) * DURATION_UNITS[unit] for val, unit in matches)
+
+
+def parse_message_refs(raw: str) -> List[Tuple[Optional[int], int]]:
+    refs: List[Tuple[Optional[int], int]] = []
+    for match in MESSAGE_REF_RE.finditer(raw):
+        ch_id, link_msg_id, plain_msg_id = match.groups()
+        if link_msg_id:
+            refs.append((int(ch_id), int(link_msg_id)))
+        elif plain_msg_id:
+            refs.append((None, int(plain_msg_id)))
+    return refs
 
 
 def format_duration_human(seconds: int) -> str:
@@ -346,7 +362,7 @@ class HorizonDatabase:
 
         used = len(rows)
         if used >= limit_count:
-            reset_ts = int(rows[0]["used_at"] + window_sec)
+            reset_ts = math.ceil(rows[0]["used_at"] + window_sec)
             return False, used, reset_ts
         return True, used, 0
 
@@ -357,6 +373,50 @@ class HorizonDatabase:
                 (user_id, command_name, time.time()),
             )
             conn.commit()
+
+    def get_open_appeal_for_user(self, user_id: int) -> Optional[sqlite3.Row]:
+        with self._get_conn() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM polls
+                WHERE action_type = 'LIFT_ISOLATION'
+                  AND target_user_id = ?
+                  AND status IN ('COOLDOWN', 'ACTIVE')
+                ORDER BY poll_id DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+
+    def upsert_isolation(
+        self,
+        user_id: int,
+        manager_id: int,
+        reason: str,
+        isolated_at: float,
+        until_ts: float,
+        new_saved_role_ids: List[int],
+    ) -> List[int]:
+        with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT saved_roles FROM isolations WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            existing_ids: List[int] = []
+            if existing and existing["saved_roles"]:
+                try:
+                    existing_ids = [int(rid) for rid in json.loads(existing["saved_roles"])]
+                except Exception:
+                    existing_ids = []
+            merged_ids = list(dict.fromkeys(existing_ids + new_saved_role_ids))
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO isolations (user_id, manager_id, reason, isolated_at, until_ts, saved_roles)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, manager_id, reason, isolated_at, until_ts, json.dumps(merged_ids)),
+            )
+            conn.commit()
+            return merged_ids
 
     def register_approved_twink(self, twink_id: int, owner_id: int, poll_id: Optional[int] = None) -> None:
         with self._get_conn() as conn:
@@ -409,7 +469,7 @@ class HorizonDatabase:
             conn.commit()
         return affected_poll_ids
 
-    # 15-minute quantized impulse logging (900s buckets, 720h retention, no message content stored)
+    # 15-minute quantized impulse logging (900s buckets, 720h retention)
     def record_message_impulse(self, user_id: int, now_ts: Optional[float] = None) -> None:
         now = now_ts or time.time()
         interval_bucket = int(now // 900)
@@ -423,11 +483,12 @@ class HorizonDatabase:
             conn.execute("DELETE FROM activity_impulses WHERE recorded_at < ?", (cutoff,))
             conn.commit()
 
-    # SVA V. RH 30-day quorum calculation:
-    # Score_d = ln(1 + impulses_d) * (0.5 + 0.5 * d / 30); requires >= 2 active days.
-    # Threshold = 50% of the weighted median of sorted user indices.
+    # SVA V. RH 30-day quorum calculation
     def calculate_active_users_stats(
-        self, extra_excluded_ids: Optional[Set[int]] = None, now_ts: Optional[float] = None
+        self,
+        extra_excluded_ids: Optional[Set[int]] = None,
+        valid_user_ids: Optional[Set[int]] = None,
+        now_ts: Optional[float] = None,
     ) -> Dict[str, Any]:
         now = now_ts or time.time()
         window_start = now - (720 * 3600)
@@ -448,6 +509,8 @@ class HorizonDatabase:
         for row in rows:
             uid = int(row["user_id"])
             if uid in excluded_ids:
+                continue
+            if valid_user_ids is not None and uid not in valid_user_ids:
                 continue
             rec_at = float(row["recorded_at"])
             day_index = int((rec_at - window_start) // 86400) + 1
@@ -650,8 +713,7 @@ class HorizonDatabase:
                 (poll_id, user_id),
             ).fetchone()
 
-    # Likert weight calculation: Support % = pos_weight / (pos_weight + |neg_weight|) * 100.
-    # Neutral votes (0) count toward physical quorum only.
+    # Likert weight calculation
     def calculate_poll_tallies(self, poll_id: int) -> Dict[str, Any]:
         with self._get_conn() as conn:
             rows = conn.execute("SELECT weight FROM votes WHERE poll_id = ?", (poll_id,)).fetchall()
@@ -682,8 +744,7 @@ class HorizonDatabase:
             "support_pct": round(support_pct, 2),
         }
 
-    # Anti-sniping ACI weight decay: full weight (1.0) during cooldown and first 50% of active duration,
-    # then decays linearly to 0.0 as (remaining_time_ratio * 2).
+    # Anti-sniping ACI weight decay
     @staticmethod
     def compute_aci_manager_weight(
         voting_starts_at: float, ends_at: float, now_ts: Optional[float] = None
@@ -803,6 +864,26 @@ def is_restricted_member(member: discord.Member) -> bool:
     return any(r.id == RESTRICTED_ROLE_ID for r in member.roles)
 
 
+def get_guild_activity_stats(
+    db: HorizonDatabase, guild: Optional[discord.Guild]
+) -> Dict[str, Any]:
+    extra_excl: Set[int] = set()
+    valid_ids: Optional[Set[int]] = None
+    if guild is not None:
+        if guild.members:
+            valid_ids = {
+                m.id for m in guild.members if not m.bot and is_full_member(m, db)
+            }
+        if TWINK_ROLE_ID > 0:
+            twink_role = guild.get_role(TWINK_ROLE_ID)
+            if twink_role:
+                extra_excl = {m.id for m in twink_role.members}
+    return db.calculate_active_users_stats(
+        extra_excluded_ids=extra_excl,
+        valid_user_ids=valid_ids,
+    )
+
+
 def split_text_into_chunks(text: str, max_chars: int = 1850) -> List[str]:
     lines = text.split("\n")
     chunks: List[str] = []
@@ -837,13 +918,7 @@ def build_poll_embed(db: HorizonDatabase, poll: sqlite3.Row, guild: Optional[dis
     tallies = db.calculate_poll_tallies(poll["poll_id"])
     aci = db.get_aci_summary(poll["poll_id"])
 
-    extra_excl: Set[int] = set()
-    if guild and TWINK_ROLE_ID > 0:
-        twink_role = guild.get_role(TWINK_ROLE_ID)
-        if twink_role:
-            extra_excl = {m.id for m in twink_role.members}
-
-    activity = db.calculate_active_users_stats(extra_excluded_ids=extra_excl)
+    activity = get_guild_activity_stats(db, guild)
     active_users_count = activity["active_count"]
     required_quorum_votes = max(1, math.ceil(active_users_count * (tier_spec.quorum_percentage / 100.0)))
 
@@ -931,7 +1006,6 @@ def build_poll_embed(db: HorizonDatabase, poll: sqlite3.Row, guild: Optional[dis
             inline=False,
         )
 
-    # Hide For/Against breakdown while poll is open to prevent conformity (Rule 6.3)
     if poll["status"] in ("COOLDOWN", "ACTIVE"):
         quorum_progress = (
             f"`{tallies['total_voters']} / {required_quorum_votes}` "
@@ -1010,6 +1084,7 @@ class ACIReportModal(discord.ui.Modal, title="🚩 Жалоба на прове�
         if not verify_guild(interaction):
             return
 
+        await interaction.response.defer(ephemeral=True)
         await self.bot.log_audit_event(
             title=f"🚩 Запрос на проверку ACI │ Голосование #{self.poll_id}",
             description=(
@@ -1021,7 +1096,7 @@ class ACIReportModal(discord.ui.Modal, title="🚩 Жалоба на прове�
             ),
             color=0xF1C40F,
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "✅ Ваш запрос на проверку по Стандарту ACI передан в канал аудита Управленцев.",
             ephemeral=True,
         )
@@ -1089,6 +1164,8 @@ class ACIValidationModal(discord.ui.Modal):
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         signed_weight, new_balance = self.bot.db.record_aci_validation(
             poll_id=self.poll_id,
             manager_id=interaction.user.id,
@@ -1112,7 +1189,7 @@ class ACIValidationModal(discord.ui.Modal):
             color=0x2ECC71 if self.verdict > 0 else 0xE74C3C,
         )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Ваша оценка ACI записана с весом **`{signed_weight:+.4f}`**. Текущий баланс ACI: **`{new_balance:+.4f}`**.",
             ephemeral=True,
         )
@@ -1263,11 +1340,13 @@ class PersistentPollView(discord.ui.View):
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         self.bot.db.cast_vote(poll["poll_id"], interaction.user.id, weight)
         updated_poll = self.bot.db.get_poll(poll["poll_id"])
         await self.bot.refresh_poll_message(updated_poll)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"🗳️ Ваш голос **«{label}»** (вес `{weight:+d}`) учтён в АСУ и защищён п. 1.2 Регламента.\n"
             f"🔒 *Выбор скрыт от других участников для защиты от конформизма (п. 6.3).*",
             ephemeral=True,
@@ -1467,6 +1546,17 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
             )
             return
 
+        allowed_cd, _, reset_ts = self.bot.db.check_command_rate_limit(
+            interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
+        )
+        if not allowed_cd:
+            await interaction.response.send_message(
+                f"⏳ **Перезарядка:** создавать голосования можно раз в `{POLL_CREATE_COOLDOWN_SECONDS}` сек. "
+                f"Следующее доступно <t:{reset_ts}:R>.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
         role_id = int(self.template_data["role_id"])
         role_name = self.template_data.get("role_name", "Управленец")
@@ -1484,6 +1574,7 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
             action_type="ELECT_MANAGER",
             action_payload={"user_id": interaction.user.id, "role_id": role_id},
         )
+        self.bot.db.record_command_usage(interaction.user.id, "create_poll")
         msg = await self.bot.publish_poll_to_channel(
             interaction,
             poll_id,
@@ -1515,13 +1606,10 @@ class HorizonBot(commands.Bot):
         ensure_sample_election_template()
         self.add_view(PersistentPollView(self))
 
-        guild_obj = discord.Object(id=ALLOWED_GUILD_ID)
-        self.tree.copy_global_to(guild=guild_obj)
-        self.tree.clear_commands(guild=None)
         try:
             await self.tree.sync()
-            await self.tree.sync(guild=guild_obj)
-            logger.info(f"Global commands wiped; clean slash commands synced for Guild ID={ALLOWED_GUILD_ID}")
+            await self.tree.sync(guild=GUILD_OBJECT)
+            logger.info(f"Global (/appeal) and guild slash commands synced for Guild ID={ALLOWED_GUILD_ID}")
         except Exception as exc:
             logger.warning(f"Failed to sync commands for {ALLOWED_GUILD_ID}: {exc}")
 
@@ -1543,14 +1631,15 @@ class HorizonBot(commands.Bot):
         if message.author.bot or not message.guild or message.guild.id != ALLOWED_GUILD_ID:
             return
         if message.content.strip() == "!sync" and isinstance(message.author, discord.Member):
-            guild_obj = discord.Object(id=ALLOWED_GUILD_ID)
-            self.tree.copy_global_to(guild=guild_obj)
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            synced = await self.tree.sync(guild=guild_obj)
+            if not has_command_permission(message.author, "sync"):
+                await message.reply("❌ У вашей должности нет прав на выполнение `!sync`.")
+                return
+            synced_global = await self.tree.sync()
+            synced_guild = await self.tree.sync(guild=GUILD_OBJECT)
             await message.reply(
-                f"✅ Синхронизировано `{len(synced)}` актуальных слэш-команд для этой Площадки. "
-                f"Нажмите **`Ctrl + R`** в Discord, чтобы сбросить старый кэш (`text_id`)."
+                f"✅ Синхронизировано `{len(synced_global) + len(synced_guild)}` актуальных слэш-команд "
+                f"(глобально: `{len(synced_global)}`, на Площадке: `{len(synced_guild)}`). "
+                f"Нажмите **`Ctrl + R`** в Discord, чтобы сбросить старый кэш."
             )
             return
         if isinstance(message.author, discord.Member) and is_full_member(message.author, self.db):
@@ -1661,7 +1750,6 @@ class HorizonBot(commands.Bot):
             except Exception as exc:
                 logger.warning(f"Audit log send failed: {exc}")
 
-    # Publishes optional multi-message "burger" blocks first, followed by the interactive voting card
     async def publish_poll_to_channel(
         self,
         interaction: discord.Interaction,
@@ -1855,13 +1943,16 @@ class HorizonBot(commands.Bot):
                     saved_ids = [r.id for r in roles_to_remove]
                     if roles_to_remove:
                         await member.remove_roles(*roles_to_remove, reason=f"АСУ SVA V. RH: Голосование #{poll['poll_id']}")
-                    await member.add_roles(restricted_role, reason=f"АСУ SVA V. RH: Голосование #{poll['poll_id']}")
-                    with self.db._get_conn() as conn:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO isolations (user_id, manager_id, reason, isolated_at, until_ts, saved_roles) VALUES (?, ?, ?, ?, 0, ?)",
-                            (member.id, self.user.id, f"Решение голосования #{poll['poll_id']}", time.time(), json.dumps(saved_ids)),
-                        )
-                        conn.commit()
+                    if restricted_role not in member.roles:
+                        await member.add_roles(restricted_role, reason=f"АСУ SVA V. RH: Голосование #{poll['poll_id']}")
+                    self.db.upsert_isolation(
+                        user_id=member.id,
+                        manager_id=self.user.id,
+                        reason=f"Решение голосования #{poll['poll_id']}",
+                        isolated_at=time.time(),
+                        until_ts=0.0,
+                        new_saved_role_ids=saved_ids,
+                    )
                     return f"Участник {member.display_name} переведён в статус Ограниченного участника."
                 return "Участник или роль Изоляции не найдены."
 
@@ -1916,103 +2007,115 @@ class HorizonBot(commands.Bot):
 
     @tasks.loop(seconds=15)
     async def poll_lifecycle_task(self) -> None:
-        now = time.time()
-        open_polls = self.db.get_open_polls()
+        try:
+            now = time.time()
+            open_polls = self.db.get_open_polls()
 
-        for poll in open_polls:
-            poll_id = poll["poll_id"]
+            for poll in open_polls:
+                try:
+                    poll_id = poll["poll_id"]
 
-            if poll["status"] == "COOLDOWN" and now >= poll["voting_starts_at"]:
-                self.db.update_poll_status(poll_id, "ACTIVE")
-                updated = self.db.get_poll(poll_id)
-                await self.refresh_poll_message(updated)
-                poll = updated
+                    if poll["status"] == "COOLDOWN" and now >= poll["voting_starts_at"]:
+                        self.db.update_poll_status(poll_id, "ACTIVE")
+                        updated = self.db.get_poll(poll_id)
+                        await self.refresh_poll_message(updated)
+                        poll = updated
 
-            if poll["status"] in ("COOLDOWN", "ACTIVE") and now >= poll["ends_at"]:
-                await self.finalize_poll(poll)
+                    if poll["status"] in ("COOLDOWN", "ACTIVE") and now >= poll["ends_at"]:
+                        await self.finalize_poll(poll)
+                except Exception as exc:
+                    logger.exception(f"Lifecycle error for poll #{poll['poll_id']}: {exc}")
 
-        guild = self.get_guild(ALLOWED_GUILD_ID)
-        if not guild:
-            return
+            guild = self.get_guild(ALLOWED_GUILD_ID)
+            if not guild:
+                return
 
-        with self.db._get_conn() as conn:
-            expired_isos = conn.execute(
-                "SELECT user_id FROM isolations WHERE until_ts > 0 AND until_ts <= ?", (now,)
-            ).fetchall()
-            active_isos = conn.execute(
-                "SELECT user_id, until_ts, reason FROM isolations WHERE until_ts = 0 OR until_ts > ?", (now,)
-            ).fetchall()
-            due_appointments = conn.execute(
-                "SELECT * FROM pending_appointments WHERE executed = 0 AND execute_at <= ?", (now,)
-            ).fetchall()
-
-        for r in expired_isos:
-            uid = int(r["user_id"])
-            member = guild.get_member(uid)
-            if member:
-                await self.restore_member_from_isolation(
-                    guild, member, reason="АСУ: Истёк срок временной Изоляции (п. 5.2 Регламента)"
-                )
-                await self.log_audit_event(
-                    title="🕊️ Автоматическое окончание Изоляции (п. 5.2)",
-                    description=f"С участника {member.mention} (`{member.id}`) снята Изоляция по истечении установленного срока.",
-                    color=0x2ECC71,
-                )
-            else:
-                with self.db._get_conn() as conn:
-                    conn.execute("DELETE FROM isolations WHERE user_id = ?", (uid,))
-                    conn.commit()
-
-        for r in active_isos:
-            uid = int(r["user_id"])
-            until_ts = float(r["until_ts"])
-            member = guild.get_member(uid)
-            if not member:
-                continue
-            rem_sec = int(until_ts - now) if until_ts > 0 else DISCORD_MAX_TIMEOUT_SECONDS
-            target_timeout = min(rem_sec, DISCORD_MAX_TIMEOUT_SECONDS)
-            if target_timeout > 3600:
-                needs_renewal = (
-                    member.timed_out_until is None
-                    or (member.timed_out_until - discord.utils.utcnow()).total_seconds() < 3600
-                )
-                if needs_renewal:
-                    try:
-                        until_dt = discord.utils.utcnow() + datetime.timedelta(seconds=target_timeout)
-                        await member.timeout(until_dt, reason=f"АСУ: Поддержание мута Изоляции ({r['reason']})")
-                    except Exception:
-                        pass
-
-        for app in due_appointments:
             with self.db._get_conn() as conn:
-                conn.execute("UPDATE pending_appointments SET executed = 1 WHERE id = ?", (app["id"],))
-                conn.commit()
+                expired_isos = conn.execute(
+                    "SELECT user_id FROM isolations WHERE until_ts > 0 AND until_ts <= ?", (now,)
+                ).fetchall()
+                active_isos = conn.execute(
+                    "SELECT user_id, until_ts, reason FROM isolations WHERE until_ts = 0 OR until_ts > ?", (now,)
+                ).fetchall()
+                due_appointments = conn.execute(
+                    "SELECT * FROM pending_appointments WHERE executed = 0 AND execute_at <= ?", (now,)
+                ).fetchall()
 
-            initiator = guild.get_member(int(app["initiator_id"]))
-            target_member = guild.get_member(int(app["target_user_id"]))
-            role = guild.get_role(int(app["role_id"]))
+            for r in expired_isos:
+                try:
+                    uid = int(r["user_id"])
+                    member = guild.get_member(uid)
+                    if member:
+                        await self.restore_member_from_isolation(
+                            guild, member, reason="АСУ: Истёк срок временной Изоляции (п. 5.2 Регламента)"
+                        )
+                        await self.log_audit_event(
+                            title="🕊️ Автоматическое окончание Изоляции (п. 5.2)",
+                            description=f"С участника {member.mention} (`{member.id}`) снята Изоляция по истечении установленного срока.",
+                            color=0x2ECC71,
+                        )
+                    else:
+                        with self.db._get_conn() as conn:
+                            conn.execute("DELETE FROM isolations WHERE user_id = ?", (uid,))
+                            conn.commit()
+                except Exception as exc:
+                    logger.exception(f"Lifecycle error for expired isolation user={r['user_id']}: {exc}")
 
-            if not initiator or not has_command_permission(initiator, "appoint") or not target_member or not role:
-                continue
-            if is_restricted_member(target_member):
-                continue
+            for r in active_isos:
+                try:
+                    uid = int(r["user_id"])
+                    until_ts = float(r["until_ts"])
+                    member = guild.get_member(uid)
+                    if not member:
+                        continue
+                    rem_sec = int(until_ts - now) if until_ts > 0 else DISCORD_MAX_TIMEOUT_SECONDS
+                    target_timeout = min(rem_sec, DISCORD_MAX_TIMEOUT_SECONDS)
+                    if target_timeout > 3600:
+                        needs_renewal = (
+                            member.timed_out_until is None
+                            or (member.timed_out_until - discord.utils.utcnow()).total_seconds() < 3600
+                        )
+                        if needs_renewal:
+                            try:
+                                until_dt = discord.utils.utcnow() + datetime.timedelta(seconds=target_timeout)
+                                await member.timeout(until_dt, reason=f"АСУ: Поддержание мута Изоляции ({r['reason']})")
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    logger.exception(f"Lifecycle error for active isolation user={r['user_id']}: {exc}")
 
-            try:
-                await target_member.add_roles(
-                    role, reason=f"АСУ /appoint (Инициатор {initiator.id}): {app['reason']}"
-                )
-                await self.log_audit_event(
-                    title="🎖️ Отложенное назначение Управленца исполнено (/appoint)",
-                    description=(
-                        f"**Назначен:** {target_member.mention} (`{target_member.id}`)\n"
-                        f"**Должность:** {role.mention}\n"
-                        f"**Инициатор:** {initiator.mention}\n"
-                        f"**Основание (п. 4.3):** {app['reason']}"
-                    ),
-                    color=0x2ECC71,
-                )
-            except Exception as exc:
-                logger.warning(f"Failed to execute /appoint #{app['id']}: {exc}")
+            for app in due_appointments:
+                try:
+                    with self.db._get_conn() as conn:
+                        conn.execute("UPDATE pending_appointments SET executed = 1 WHERE id = ?", (app["id"],))
+                        conn.commit()
+
+                    initiator = guild.get_member(int(app["initiator_id"]))
+                    target_member = guild.get_member(int(app["target_user_id"]))
+                    role = guild.get_role(int(app["role_id"]))
+
+                    if not initiator or not has_command_permission(initiator, "appoint") or not target_member or not role:
+                        continue
+                    if is_restricted_member(target_member):
+                        continue
+
+                    await target_member.add_roles(
+                        role, reason=f"АСУ /appoint (Инициатор {initiator.id}): {app['reason']}"
+                    )
+                    await self.log_audit_event(
+                        title="🎖️ Отложенное назначение Управленца исполнено (/appoint)",
+                        description=(
+                            f"**Назначен:** {target_member.mention} (`{target_member.id}`)\n"
+                            f"**Должность:** {role.mention}\n"
+                            f"**Инициатор:** {initiator.mention}\n"
+                            f"**Основание (п. 4.3):** {app['reason']}"
+                        ),
+                        color=0x2ECC71,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to execute /appoint #{app['id']}: {exc}")
+        except Exception as exc:
+            logger.exception(f"Unhandled error in poll_lifecycle_task: {exc}")
 
     @poll_lifecycle_task.before_loop
     async def before_poll_lifecycle(self) -> None:
@@ -2023,10 +2126,11 @@ class HorizonBot(commands.Bot):
         tier_spec = TIERS[poll["tier"]]
         tallies = self.db.calculate_poll_tallies(poll_id)
         aci = self.db.get_aci_summary(poll_id)
-        activity = self.db.calculate_active_users_stats()
+        guild = self.get_guild(ALLOWED_GUILD_ID)
+        activity = get_guild_activity_stats(self.db, guild)
 
         active_users_count = activity["active_count"]
-        required_quorum = math.ceil(active_users_count * (tier_spec.quorum_percentage / 100.0))
+        required_quorum = max(1, math.ceil(active_users_count * (tier_spec.quorum_percentage / 100.0)))
 
         exec_log = ""
         if not poll["aci_immune"] and aci["balance"] <= -0.5:
@@ -2101,6 +2205,7 @@ CATEGORY_CHOICES = [
 @bot.tree.command(
     name="poll",
     description="Запустить голосование SVA V. RH по 1 или нескольким ID/ссылкам сообщений Discord («бургер»)",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     category="Категория инициативы (АСУ автоматически определит Тир и параметры)",
@@ -2123,8 +2228,19 @@ async def cmd_poll_by_id(
         )
         return
 
-    snowflakes = SNOWFLAKE_RE.findall(message_ids)
-    if not snowflakes:
+    allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
+        interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
+    )
+    if not allowed_cd:
+        await interaction.response.send_message(
+            f"⏳ **Перезарядка:** создавать голосования можно раз в `{POLL_CREATE_COOLDOWN_SECONDS}` сек. "
+            f"Следующее доступно <t:{reset_ts}:R>.",
+            ephemeral=True,
+        )
+        return
+
+    refs = parse_message_refs(message_ids)
+    if not refs:
         await interaction.response.send_message(
             "❌ Не найдено корректных ID или ссылок на сообщения в параметре `message_ids`.",
             ephemeral=True,
@@ -2137,12 +2253,21 @@ async def cmd_poll_by_id(
     combined_texts: List[str] = []
     all_att_meta: List[Dict[str, str]] = []
 
-    for sf in snowflakes:
+    for ch_id, msg_id in refs:
+        preferred_ch = interaction.channel
+        if ch_id and interaction.guild:
+            preferred_ch = interaction.guild.get_channel_or_thread(ch_id)
+            if preferred_ch is None:
+                try:
+                    preferred_ch = await interaction.guild.fetch_channel(ch_id)
+                except Exception:
+                    preferred_ch = interaction.channel
+
         msg_obj = await bot.fetch_message_across_guild(
-            interaction.guild, int(sf), preferred_channel=interaction.channel
+            interaction.guild, msg_id, preferred_channel=preferred_ch
         )
         if not msg_obj:
-            await interaction.followup.send(f"❌ Сообщение с ID `{sf}` не найдено на Площадке.")
+            await interaction.followup.send(f"❌ Сообщение с ID `{msg_id}` не найдено на Площадке.")
             return
         m_text, m_att_meta, m_raw_files = await bot.extract_message_payload(msg_obj)
         burger_blocks.append((f"От {msg_obj.author.display_name}", m_text, m_raw_files))
@@ -2162,6 +2287,7 @@ async def cmd_poll_by_id(
         attachments_meta=all_att_meta,
         custom_hash=combined_hash,
     )
+    bot.db.record_command_usage(interaction.user.id, "create_poll")
     msg = await bot.publish_poll_to_channel(
         interaction, poll_id, burger_blocks=burger_blocks if use_burger else None
     )
@@ -2178,6 +2304,7 @@ async def cmd_poll_by_id(
 @bot.tree.command(
     name="poll_impeach",
     description="Пункт 6.8: Специальное шаблонное голосование за снятие Управленца в обход ACI (полный иммунитет)",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(manager="Действующий Управленец, вопрос о снятии прав с которого выносится на голосование")
 async def cmd_poll_impeach(interaction: discord.Interaction, manager: discord.Member) -> None:
@@ -2187,6 +2314,17 @@ async def cmd_poll_impeach(interaction: discord.Interaction, manager: discord.Me
     if not is_full_member(interaction.user, bot.db):
         await interaction.response.send_message(
             "🚫 Инициировать процедуру п. 6.8 могут только **Полноценные участники**.",
+            ephemeral=True,
+        )
+        return
+
+    allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
+        interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
+    )
+    if not allowed_cd:
+        await interaction.response.send_message(
+            f"⏳ **Перезарядка:** создавать голосования можно раз в `{POLL_CREATE_COOLDOWN_SECONDS}` сек. "
+            f"Следующее доступно <t:{reset_ts}:R>.",
             ephemeral=True,
         )
         return
@@ -2206,6 +2344,8 @@ async def cmd_poll_impeach(interaction: discord.Interaction, manager: discord.Me
         )
         return
 
+    await interaction.response.defer(ephemeral=False)
+
     fixed_template_text = (
         f"[ШАБЛОННОЕ ГОЛОСОВАНИЕ АСУ ПО П. 6.8 РЕГЛАМЕНТА]\n"
         f"Предмет голосования: Досрочное прекращение полномочий и снятие всех управленческих ролей "
@@ -2222,18 +2362,19 @@ async def cmd_poll_impeach(interaction: discord.Interaction, manager: discord.Me
         action_type="IMPEACH_MANAGER",
         action_payload={"user_id": manager.id},
     )
+    bot.db.record_command_usage(interaction.user.id, "create_poll")
     msg = await bot.publish_poll_to_channel(interaction, poll_id)
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"🛡️ **Специальное голосование #{poll_id} (п. 6.8)** за снятие Управленца {manager.mention} запущено!\n"
-        f"Голосование обладает полным системным иммунитетом к ACI: {msg.jump_url if msg else ''}",
-        ephemeral=False,
+        f"Голосование обладает полным системным иммунитетом к ACI: {msg.jump_url if msg else ''}"
     )
 
 
 @bot.tree.command(
     name="pollelection",
     description="Пункт 7.1 и 7.2: Подать заявку и пройти анкетирование на должность Управленца",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(role="Управленческая роль, на которую вы выдвигаетесь")
 async def cmd_pollelection(interaction: discord.Interaction, role: discord.Role) -> None:
@@ -2243,6 +2384,17 @@ async def cmd_pollelection(interaction: discord.Interaction, role: discord.Role)
     if not is_full_member(interaction.user, bot.db):
         await interaction.response.send_message(
             "🚫 Выдвигаться на должности могут только **Полноценные участники** (п. 1.3).",
+            ephemeral=True,
+        )
+        return
+
+    allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
+        interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
+    )
+    if not allowed_cd:
+        await interaction.response.send_message(
+            f"⏳ **Перезарядка:** создавать голосования можно раз в `{POLL_CREATE_COOLDOWN_SECONDS}` сек. "
+            f"Следующее доступно <t:{reset_ts}:R>.",
             ephemeral=True,
         )
         return
@@ -2304,6 +2456,23 @@ async def cmd_public_appeal(interaction: discord.Interaction, justification: str
         )
         return
 
+    existing_appeal = bot.db.get_open_appeal_for_user(member.id)
+    if existing_appeal:
+        jump_url = (
+            f"https://discord.com/channels/{guild.id}/{existing_appeal['channel_id']}/{existing_appeal['message_id']}"
+            if existing_appeal["channel_id"] and existing_appeal["message_id"]
+            else ""
+        )
+        link_part = f": {jump_url}" if jump_url else ""
+        await interaction.response.send_message(
+            f"⚠️ У вас уже есть незавершённая Публичная апелляция **#{existing_appeal['poll_id']}**{link_part}. "
+            f"Подать новую можно только после её окончания.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
     appeal_text = (
         f"[ПУБЛИЧНАЯ АПЕЛЛЯЦИЯ ПО П. 5.1 РЕГЛАМЕНТА]\n"
         f"Апеллянт: {member.display_name} (ID: {member.id})\n"
@@ -2323,7 +2492,7 @@ async def cmd_public_appeal(interaction: discord.Interaction, justification: str
     )
     msg = await bot.publish_poll_to_channel(interaction, poll_id)
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"⚖️ Ваша **Публичная апелляция #{poll_id}** (Тир III `[Правосудие]`) опубликована: "
         f"{msg.jump_url if msg else 'в канале голосований'}.",
         ephemeral=True,
@@ -2333,6 +2502,7 @@ async def cmd_public_appeal(interaction: discord.Interaction, justification: str
 @bot.tree.command(
     name="poll_action",
     description="Пункт 6.6 и 7.1.1: Запустить шаблонное голосование с автоисполнением действия ботом АСУ",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     action="Тип автоматического действия, которое бот выполнит сам при победе голосования",
@@ -2365,6 +2535,17 @@ async def cmd_poll_action(
     if not is_full_member(interaction.user, bot.db):
         await interaction.response.send_message(
             "🚫 Запускать шаблонные голосования могут только **Полноценные участники**.",
+            ephemeral=True,
+        )
+        return
+
+    allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
+        interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
+    )
+    if not allowed_cd:
+        await interaction.response.send_message(
+            f"⏳ **Перезарядка:** создавать голосования можно раз в `{POLL_CREATE_COOLDOWN_SECONDS}` сек. "
+            f"Следующее доступно <t:{reset_ts}:R>.",
             ephemeral=True,
         )
         return
@@ -2430,6 +2611,8 @@ async def cmd_poll_action(
     else:
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     full_text = f"{header}\n\nОбоснование инициативы:\n{rationale.strip()}"
     poll_id = bot.db.create_poll(
         initiator_id=interaction.user.id,
@@ -2439,8 +2622,9 @@ async def cmd_poll_action(
         action_type=db_action,
         action_payload=payload,
     )
+    bot.db.record_command_usage(interaction.user.id, "create_poll")
     msg = await bot.publish_poll_to_channel(interaction, poll_id)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"⚙️ **Автоматизированное голосование #{poll_id}** (`[{category}]`) запущено!\n"
         f"В случае победы бот исполнит действие автоматически: {msg.jump_url if msg else ''}",
         ephemeral=True,
@@ -2450,6 +2634,7 @@ async def cmd_poll_action(
 @bot.tree.command(
     name="isolate",
     description="Пункт 3.5 и 4.3: Поместить участника в Изоляцию с мутом и сохранением ролей (лимит: 3 в 24ч)",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     member="Участник, помещаемый в Изоляцию",
@@ -2541,15 +2726,14 @@ async def cmd_isolate_member(
 
     now = time.time()
     until_ts = (now + duration_sec) if duration_sec > 0 else 0.0
-    with bot.db._get_conn() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO isolations (user_id, manager_id, reason, isolated_at, until_ts, saved_roles)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (member.id, interaction.user.id, reason.strip(), now, until_ts, json.dumps(saved_role_ids)),
-        )
-        conn.commit()
+    merged_role_ids = bot.db.upsert_isolation(
+        user_id=member.id,
+        manager_id=interaction.user.id,
+        reason=reason.strip(),
+        isolated_at=now,
+        until_ts=until_ts,
+        new_saved_role_ids=saved_role_ids,
+    )
 
     bot.db.record_command_usage(interaction.user.id, "isolate")
     human_dur = format_duration_human(duration_sec)
@@ -2562,7 +2746,7 @@ async def cmd_isolate_member(
             f"**Управленец:** {interaction.user.mention} (Лимит 24ч: `{used_cnt + 1}/{DAILY_ISOLATE_LIMIT}`)\n"
             f"**Причина (п. 4.3):** {reason.strip()}\n"
             f"**Срок (п. 5.2):** {dur_display}\n"
-            f"**Сохранено ролей:** `{len(saved_role_ids)}`\n\n"
+            f"**Сохранено ролей:** `{len(merged_role_ids)}`\n\n"
             f"*Участник сохраняет право подать Публичную апелляцию командой `/appeal` (п. 5.1). "
             f"Голоса, отданные им до Изоляции, остаются неприкосновенными (п. 1.2).*"
         ),
@@ -2595,6 +2779,7 @@ async def cmd_isolate_member(
 @bot.tree.command(
     name="unisolate",
     description="Досрочно снять Изоляцию с участника и вернуть все сохранённые роли",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(member="Изолированный участник", reason="Публичная причина снятия ограничений (п. 4.3)")
 async def cmd_unisolate_member(
@@ -2627,27 +2812,28 @@ async def cmd_unisolate_member(
 
 
 @bot.tree.command(
-    name="ban_twink",
+    name="kick_twink",
     description="Пункт 1.2 и 2.6: Аннулировать голоса и кикнуть изолированного твинка (лимит: 1 в 24ч)",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     member="Находящийся в Изоляции рядовой участник (доказанный твинк)",
     reason="Доказательство принадлежности дополнительного аккаунта (п. 2.6, 4.3)",
 )
-async def cmd_ban_twink(interaction: discord.Interaction, member: discord.Member, reason: str) -> None:
+async def cmd_kick_twink(interaction: discord.Interaction, member: discord.Member, reason: str) -> None:
     if not verify_guild(interaction) or not isinstance(interaction.user, discord.Member):
         return
 
-    if not has_command_permission(interaction.user, "ban_twink"):
-        await interaction.response.send_message("❌ У вашей должности нет прав на выполнение `/ban_twink`.", ephemeral=True)
+    if not has_command_permission(interaction.user, "kick_twink"):
+        await interaction.response.send_message("❌ У вашей должности нет прав на выполнение `/kick_twink`.", ephemeral=True)
         return
 
     allowed, _, reset_ts = bot.db.check_command_rate_limit(
-        interaction.user.id, "ban_twink", DAILY_BAN_TWINK_LIMIT
+        interaction.user.id, "kick_twink", DAILY_KICK_TWINK_LIMIT
     )
     if not allowed:
         await interaction.response.send_message(
-            f"⏳ **Перезарядка команды:** `/ban_twink` можно использовать не чаще **1 раза в 24 часа**.\n"
+            f"⏳ **Перезарядка команды:** `/kick_twink` можно использовать не чаще **1 раза в 24 часа**.\n"
             f"Доступно повторно: <t:{reset_ts}:R>.",
             ephemeral=True,
         )
@@ -2658,7 +2844,7 @@ async def cmd_ban_twink(interaction: discord.Interaction, member: discord.Member
 
     if not is_restricted_member(member) and not iso_row:
         await interaction.response.send_message(
-            "⚠️ Команда `/ban_twink` может применяться **только к участникам, предварительно помещённым в Изоляцию** (`/isolate`).",
+            "⚠️ Команда `/kick_twink` может применяться **только к участникам, предварительно помещённым в Изоляцию** (`/isolate`).",
             ephemeral=True,
         )
         return
@@ -2673,7 +2859,7 @@ async def cmd_ban_twink(interaction: discord.Interaction, member: discord.Member
 
     if is_manager(member) or has_saved_mgr:
         await interaction.response.send_message(
-            "🚫 Запрещено применять `/ban_twink` к действующим или изолированным Управленцам!",
+            "🚫 Запрещено применять `/kick_twink` к действующим или изолированным Управленцам!",
             ephemeral=True,
         )
         return
@@ -2696,10 +2882,10 @@ async def cmd_ban_twink(interaction: discord.Interaction, member: discord.Member
         await interaction.followup.send("❌ У бота недостаточно прав Discord для кика этого пользователя.")
         return
 
-    bot.db.record_command_usage(interaction.user.id, "ban_twink")
+    bot.db.record_command_usage(interaction.user.id, "kick_twink")
 
     await bot.log_audit_event(
-        title="🚫 Пресечение твинк-аккаунта (/ban_twink │ п. 1.2, 2.6)",
+        title="🚫 Пресечение твинк-аккаунта (/kick_twink │ п. 1.2, 2.6)",
         description=(
             f"**Исключённый аккаунт:** {member.mention} (`{member.id}`)\n"
             f"**Управленец:** {interaction.user.mention}\n"
@@ -2717,6 +2903,7 @@ async def cmd_ban_twink(interaction: discord.Interaction, member: discord.Member
 @bot.tree.command(
     name="appoint",
     description="Техническая выдача роли Управленца с задержкой безопасности 30 мин. (лимит: 3 в 24ч)",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     user="Назначаемый участник",
@@ -2760,6 +2947,8 @@ async def cmd_appoint_manager(
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     execute_at = time.time() + APPOINT_DELAY_SECONDS
     with bot.db._get_conn() as conn:
         conn.execute(
@@ -2785,7 +2974,7 @@ async def cmd_appoint_manager(
         ),
         color=0x3498DB,
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Назначение роли {role.mention} участнику {user.mention} поставлено в очередь АСУ и исполнится <t:{exec_int}:R>.",
         ephemeral=True,
     )
@@ -2794,6 +2983,7 @@ async def cmd_appoint_manager(
 @bot.tree.command(
     name="selfimpeach",
     description="Пункт 7.3: Добровольно сложить с себя полномочия Управленца",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(role="Управленческая роль, которую вы хотите снять с себя")
 async def cmd_selfimpeach(interaction: discord.Interaction, role: discord.Role) -> None:
@@ -2811,10 +3001,12 @@ async def cmd_selfimpeach(interaction: discord.Interaction, role: discord.Role) 
         await interaction.response.send_message(f"ℹ️ У вас нет роли {role.mention}.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     try:
         await interaction.user.remove_roles(role, reason="АСУ п. 7.3: Добровольная отставка Управленца (/selfimpeach)")
     except discord.Forbidden:
-        await interaction.response.send_message("❌ Бот не может снять эту роль из-за иерархии ролей.", ephemeral=True)
+        await interaction.followup.send("❌ Бот не может снять эту роль из-за иерархии ролей.", ephemeral=True)
         return
 
     await bot.log_audit_event(
@@ -2822,7 +3014,7 @@ async def cmd_selfimpeach(interaction: discord.Interaction, role: discord.Role) 
         description=f"Участник {interaction.user.mention} (`{interaction.user.id}`) добровольно сложил полномочия {role.mention}.",
         color=0xF1C40F,
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Вы добровольно сложили с себя полномочия {role.mention} (п. 7.3 Регламента).", ephemeral=True
     )
 
@@ -2830,6 +3022,7 @@ async def cmd_selfimpeach(interaction: discord.Interaction, role: discord.Role) 
 @bot.tree.command(
     name="unexecutable",
     description="Пункт 6.10 и 6.10.1: Опубликовать мотивированный отказ от реализации по неисполнимости",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     poll_id="Номер завершившегося победой голосования",
@@ -2860,6 +3053,8 @@ async def cmd_unexecutable(
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     formatted_reason = f"[{clause.value} Регламента] {proof.strip()}"
     bot.db.mark_poll_unexecutable(poll_id, interaction.user.id, formatted_reason)
     updated_poll = bot.db.get_poll(poll_id)
@@ -2874,7 +3069,7 @@ async def cmd_unexecutable(
         ),
         color=0xE67E22,
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Мотивированный отказ по **{clause.value}** прикреплён к карточке голосования `#{poll_id}` и опубликован в аудит-логе.",
         ephemeral=True,
     )
@@ -2883,6 +3078,7 @@ async def cmd_unexecutable(
 @bot.tree.command(
     name="approve_twink",
     description="Пункт 2.6: Внести технический аккаунт в реестр без права голоса",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     twink_user="Технический/проектный дополнительный аккаунт",
@@ -2901,6 +3097,8 @@ async def cmd_approve_twink(
     if not has_command_permission(interaction.user, "approve_twink"):
         await interaction.response.send_message("❌ У вашей должности нет прав на выполнение `/approve_twink`.", ephemeral=True)
         return
+
+    await interaction.response.defer(ephemeral=True)
 
     poll_info_str = "Без привязки к голосованию (прямое решение Управленца)"
     if poll_id is not None:
@@ -2936,7 +3134,7 @@ async def cmd_approve_twink(
         ),
         color=0x1ABC9C,
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Аккаунт {twink_user.mention} внесён в реестр технических аккаунтов без права голоса "
         f"(владелец: {owner_user.mention}, основание: {poll_info_str}).",
         ephemeral=True,
@@ -2946,6 +3144,7 @@ async def cmd_approve_twink(
 @bot.tree.command(
     name="unapprove_twink",
     description="Пункт 2.6: Снять с пользователя статус технического аккаунта (твинка) и вернуть право голоса",
+    guild=GUILD_OBJECT,
 )
 @app_commands.describe(
     twink_user="Аккаунт, с которого снимается статус технического твинка",
@@ -2968,6 +3167,8 @@ async def cmd_unapprove_twink(
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     was_in_db = bot.db.remove_approved_twink(twink_user.id)
     role_removed = False
 
@@ -2983,7 +3184,7 @@ async def cmd_unapprove_twink(
                 pass
 
     if not was_in_db and not role_removed:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"ℹ️ У пользователя {twink_user.mention} не было статуса или роли технического аккаунта.",
             ephemeral=True,
         )
@@ -2998,7 +3199,7 @@ async def cmd_unapprove_twink(
         ),
         color=0x2ECC71,
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ С аккаунта {twink_user.mention} снят статус технического твинка.",
         ephemeral=True,
     )
@@ -3007,6 +3208,7 @@ async def cmd_unapprove_twink(
 @bot.tree.command(
     name="list",
     description="Показать список всех текущих активных и охлаждающихся голосований Площадки",
+    guild=GUILD_OBJECT,
 )
 async def cmd_poll_list(interaction: discord.Interaction) -> None:
     if not verify_guild(interaction) or not interaction.guild:
@@ -3017,7 +3219,7 @@ async def cmd_poll_list(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("📭 Активных голосований в данный момент нет.", ephemeral=True)
         return
 
-    activity = bot.db.calculate_active_users_stats()
+    activity = get_guild_activity_stats(bot.db, interaction.guild)
     active_cnt = activity["active_count"]
     lines = []
 
@@ -3051,18 +3253,13 @@ async def cmd_poll_list(interaction: discord.Interaction) -> None:
 @bot.tree.command(
     name="activelist",
     description="Подробная сводка 30-дневной модели кворума, импульсов и индексов участников (п. 6.7)",
+    guild=GUILD_OBJECT,
 )
 async def cmd_activelist(interaction: discord.Interaction) -> None:
     if not verify_guild(interaction) or not interaction.guild:
         return
 
-    extra_excl: Set[int] = set()
-    if TWINK_ROLE_ID > 0:
-        twink_role = interaction.guild.get_role(TWINK_ROLE_ID)
-        if twink_role:
-            extra_excl = {m.id for m in twink_role.members}
-
-    stats = bot.db.calculate_active_users_stats(extra_excluded_ids=extra_excl)
+    stats = get_guild_activity_stats(bot.db, interaction.guild)
     active_cnt = stats["active_count"]
     details_map = stats["user_details"]
 
@@ -3142,6 +3339,7 @@ async def cmd_activelist(interaction: discord.Interaction) -> None:
 @bot.tree.command(
     name="help",
     description="Справка по всем командам АСУ «Горизонт» и архитектуре SVA V. RH",
+    guild=GUILD_OBJECT,
 )
 async def cmd_help(interaction: discord.Interaction) -> None:
     help_text = (
@@ -3160,7 +3358,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
         "### 🛡️ Команды Управленцев (по ролям из `COMMAND_PERMISSIONS`)\n"
         "• `/isolate <@member> <reason> [duration]` — перевести в Изоляцию с сохранением ролей и мутом (п. 3.5, лимит 3/24ч).\n"
         "• `/unisolate <@member> [reason]` — досрочно снять Изоляцию и вернуть роли.\n"
-        "• `/ban_twink <@member> <reason>` — очистить голоса и кикнуть изолированного твинка (п. 1.2, 2.6, лимит 1/24ч).\n"
+        "• `/kick_twink <@member> <reason>` — очистить голоса и кикнуть изолированного твинка (п. 1.2, 2.6, лимит 1/24ч).\n"
         "• `/appoint <@user> <@role> <reason>` — выдать роль Управленца с задержкой 30 минут (лимит 3/24ч).\n"
         "• `/selfimpeach <@role>` — добровольно сложить полномочия Управленца (п. 7.3).\n"
         "• `/unexecutable <poll_id> <clause> <proof>` — мотивированный отказ по неисполнимости (п. 6.10 / 6.10.1).\n"
