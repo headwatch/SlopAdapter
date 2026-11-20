@@ -144,11 +144,16 @@ def ensure_sample_election_template() -> None:
             "/*\n"
             "ПРИМЕР ШАБЛОНА АНКЕТЫ ДЛЯ ВЫБОРОВ (/pollelection) — п. 7.1, 7.2 Регламента\n"
             "Скопируйте этот файл, назовите его по ID роли (например: 222222222222222222.json),\n"
-            "уберите комментарии /* */ и укажите реальный role_id:\n\n"
+            "уберите комментарии /* */ и укажите реальный role_id.\n"
+            "Поля cooldown, duration, quorum_percentage и required_role_ids необязательны:\n\n"
             "{\n"
             f'    "role_id": {default_role_id},\n'
             '    "role_name": "Управленец",\n'
             '    "description": "Квалификационная анкета кандидата на должность Управленца сообщества «Горизонт» (п. 7.1, 7.2).",\n'
+            '    "cooldown": "12h",\n'
+            '    "duration": "72h",\n'
+            '    "quorum_percentage": 40,\n'
+            '    "required_role_ids": [],\n'
             '    "questions": [\n'
             '        "1. Ваш часовой пояс и среднее время активности в сутки?",\n'
             '        "2. Опишите ваш опыт модерации и знание Стандарта ACI.",\n'
@@ -174,6 +179,37 @@ def parse_duration_string(duration_str: str) -> Optional[int]:
     if WHITESPACE_RE.sub("", cleaned) != reconstructed:
         return None
     return sum(int(val) * DURATION_UNITS[unit] for val, unit in matches)
+
+
+def parse_template_duration(value: Any, default_sec: int) -> int:
+    if value is None or isinstance(value, bool):
+        return default_sec
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return default_sec
+        if cleaned.isdigit():
+            return int(cleaned)
+        parsed = parse_duration_string(cleaned)
+        if parsed is not None:
+            return parsed
+    return default_sec
+
+
+def parse_required_role_ids(raw: Any) -> List[int]:
+    if not isinstance(raw, list):
+        return []
+    result: List[int] = []
+    for item in raw:
+        try:
+            rid = int(item)
+            if rid > 0:
+                result.append(rid)
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def parse_message_refs(raw: str) -> List[Tuple[Optional[int], int]]:
@@ -260,7 +296,8 @@ class HorizonDatabase:
                     burger_links_json TEXT NOT NULL DEFAULT '[]',
                     attachments_meta_json TEXT NOT NULL DEFAULT '[]',
                     unexecutable_by_id INTEGER,
-                    unexecutable_reason TEXT
+                    unexecutable_reason TEXT,
+                    custom_quorum_pct REAL
                 )
             """)
 
@@ -269,6 +306,7 @@ class HorizonDatabase:
                 "attachments_meta_json TEXT NOT NULL DEFAULT '[]'",
                 "unexecutable_by_id INTEGER",
                 "unexecutable_reason TEXT",
+                "custom_quorum_pct REAL",
             ]:
                 try:
                     cursor.execute(f"ALTER TABLE polls ADD COLUMN {col_def}")
@@ -608,13 +646,26 @@ class HorizonDatabase:
         burger_links: Optional[List[str]] = None,
         attachments_meta: Optional[List[Dict[str, str]]] = None,
         custom_hash: Optional[str] = None,
+        cooldown_seconds_override: Optional[int] = None,
+        duration_seconds_override: Optional[int] = None,
+        quorum_pct_override: Optional[float] = None,
     ) -> int:
         tier_id, _ = CATEGORIES[category]
         spec = TIERS[tier_id]
 
         now = time.time()
-        cooldown_sec = spec.cooldown_seconds * TIME_SCALE
-        duration_sec = spec.duration_seconds * TIME_SCALE
+        base_cooldown = (
+            spec.cooldown_seconds
+            if cooldown_seconds_override is None
+            else max(0, cooldown_seconds_override)
+        )
+        base_duration = (
+            spec.duration_seconds
+            if (duration_seconds_override is None or duration_seconds_override <= 0)
+            else duration_seconds_override
+        )
+        cooldown_sec = base_cooldown * TIME_SCALE
+        duration_sec = base_duration * TIME_SCALE
 
         voting_starts_at = now + cooldown_sec
         ends_at = voting_starts_at + duration_sec
@@ -628,8 +679,8 @@ class HorizonDatabase:
                     initiator_id, category, tier, proposal_text, proposal_hash,
                     created_at, voting_starts_at, ends_at, status, aci_immune,
                     target_user_id, action_type, action_payload,
-                    burger_links_json, attachments_meta_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    burger_links_json, attachments_meta_json, custom_quorum_pct
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     initiator_id,
@@ -647,6 +698,7 @@ class HorizonDatabase:
                     json.dumps(action_payload or {}, ensure_ascii=False),
                     json.dumps(burger_links or [], ensure_ascii=False),
                     json.dumps(attachments_meta or [], ensure_ascii=False),
+                    quorum_pct_override,
                 ),
             )
             conn.commit()
@@ -871,6 +923,13 @@ def is_restricted_member(member: discord.Member) -> bool:
     return any(r.id == RESTRICTED_ROLE_ID for r in member.roles)
 
 
+def get_poll_quorum_pct(poll: sqlite3.Row) -> float:
+    custom_q = poll["custom_quorum_pct"]
+    if custom_q is not None:
+        return float(custom_q)
+    return TIERS[poll["tier"]].quorum_percentage
+
+
 def validate_voting_forum_post(
     db: HorizonDatabase, interaction: discord.Interaction
 ) -> Tuple[bool, str]:
@@ -940,12 +999,13 @@ def split_text_into_chunks(text: str, max_chars: int = 1850) -> List[str]:
 
 def build_poll_embed(db: HorizonDatabase, poll: sqlite3.Row, guild: Optional[discord.Guild] = None) -> discord.Embed:
     tier_spec = TIERS[poll["tier"]]
+    quorum_pct = get_poll_quorum_pct(poll)
     tallies = db.calculate_poll_tallies(poll["poll_id"])
     aci = db.get_aci_summary(poll["poll_id"])
 
     activity = get_guild_activity_stats(db, guild)
     active_users_count = activity["active_count"]
-    required_quorum_votes = max(1, math.ceil(active_users_count * (tier_spec.quorum_percentage / 100.0)))
+    required_quorum_votes = max(1, math.ceil(active_users_count * (quorum_pct / 100.0)))
 
     status_map = {
         "COOLDOWN": "🧊 ВРЕМЯ НА ОХЛАЖДЕНИЕ (Чтение и обсуждение)",
@@ -989,7 +1049,7 @@ def build_poll_embed(db: HorizonDatabase, poll: sqlite3.Row, guild: Optional[dis
         value=(
             f"• **Тир:** `{tier_spec.code}`\n"
             f"• **Порог победы:** `> {tier_spec.win_percentage:.0f}%`\n"
-            f"• **Требуемый кворум:** `{tier_spec.quorum_percentage:.0f}%` от активных\n"
+            f"• **Требуемый кворум:** `{quorum_pct:g}%` от активных\n"
             f"• **Шкала:** `⏫+2 🔼+1 ⏺️0 🔽-1 ⏬-2`"
         ),
         inline=True,
@@ -1546,7 +1606,11 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
             self.add_item(inp)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.candidate_id or not interaction.guild:
+        if (
+            interaction.user.id != self.candidate_id
+            or not interaction.guild
+            or not isinstance(interaction.user, discord.Member)
+        ):
             return
 
         for q_text, inp in zip(self.current_batch, self.inputs):
@@ -1570,6 +1634,18 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
                 ephemeral=True,
             )
             return
+
+        required_role_ids = parse_required_role_ids(self.template_data.get("required_role_ids"))
+        if required_role_ids:
+            member_role_ids = {r.id for r in interaction.user.roles}
+            missing_role_ids = [rid for rid in required_role_ids if rid not in member_role_ids]
+            if missing_role_ids:
+                missing_str = ", ".join(f"<@&{rid}>" for rid in missing_role_ids)
+                await interaction.response.send_message(
+                    f"🚫 Для подачи этой анкеты необходимо иметь обязательные роли: {missing_str}.",
+                    ephemeral=True,
+                )
+                return
 
         ok_post, post_err = validate_voting_forum_post(self.bot.db, interaction)
         if not ok_post:
@@ -1596,6 +1672,23 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
         qa_text = "\n\n".join(f"• {q}\nОтвет: {a}" for q, a in self.collected_answers)
         full_text = f"[{header_desc}]\nКандидат: {interaction.user.display_name} (ID: {interaction.user.id})\n\n{qa_text}"
 
+        staff_spec = TIERS[CATEGORIES["Стафф"][0]]
+        custom_cooldown = parse_template_duration(
+            self.template_data.get("cooldown"), staff_spec.cooldown_seconds
+        )
+        custom_duration = parse_template_duration(
+            self.template_data.get("duration"), staff_spec.duration_seconds
+        )
+        custom_quorum: Optional[float] = None
+        raw_quorum = self.template_data.get("quorum_percentage")
+        if raw_quorum is not None and not isinstance(raw_quorum, bool):
+            try:
+                q_val = float(raw_quorum)
+                if 0.0 < q_val <= 100.0:
+                    custom_quorum = q_val
+            except (TypeError, ValueError):
+                custom_quorum = None
+
         poll_id = self.bot.db.create_poll(
             initiator_id=interaction.user.id,
             category="Стафф",
@@ -1603,6 +1696,9 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
             target_user_id=interaction.user.id,
             action_type="ELECT_MANAGER",
             action_payload={"user_id": interaction.user.id, "role_id": role_id},
+            cooldown_seconds_override=custom_cooldown,
+            duration_seconds_override=custom_duration,
+            quorum_pct_override=custom_quorum,
         )
         self.bot.db.record_command_usage(interaction.user.id, "create_poll")
         msg = await self.bot.publish_poll_to_channel(
@@ -2182,13 +2278,14 @@ class HorizonBot(commands.Bot):
     async def finalize_poll(self, poll: sqlite3.Row) -> None:
         poll_id = poll["poll_id"]
         tier_spec = TIERS[poll["tier"]]
+        quorum_pct = get_poll_quorum_pct(poll)
         tallies = self.db.calculate_poll_tallies(poll_id)
         aci = self.db.get_aci_summary(poll_id)
         guild = self.get_guild(ALLOWED_GUILD_ID)
         activity = get_guild_activity_stats(self.db, guild)
 
         active_users_count = activity["active_count"]
-        required_quorum = max(1, math.ceil(active_users_count * (tier_spec.quorum_percentage / 100.0)))
+        required_quorum = max(1, math.ceil(active_users_count * (quorum_pct / 100.0)))
 
         exec_log = ""
         if not poll["aci_immune"] and aci["balance"] <= -0.5:
@@ -2495,6 +2592,18 @@ async def cmd_pollelection(interaction: discord.Interaction, role: discord.Role)
             ephemeral=True,
         )
         return
+
+    required_role_ids = parse_required_role_ids(matched_template.get("required_role_ids"))
+    if required_role_ids:
+        member_role_ids = {r.id for r in interaction.user.roles}
+        missing_role_ids = [rid for rid in required_role_ids if rid not in member_role_ids]
+        if missing_role_ids:
+            missing_str = ", ".join(f"<@&{rid}>" for rid in missing_role_ids)
+            await interaction.response.send_message(
+                f"🚫 Для выдвижения на роль {role.mention} необходимо иметь обязательные роли: {missing_str}.",
+                ephemeral=True,
+            )
+            return
 
     modal = ElectionQuestionnaireModal(
         bot=bot,
@@ -3320,7 +3429,8 @@ async def cmd_poll_list(interaction: discord.Interaction) -> None:
 
     for idx, p in enumerate(open_polls, 1):
         spec = TIERS[p["tier"]]
-        req_q = max(1, math.ceil(active_cnt * (spec.quorum_percentage / 100.0)))
+        quorum_pct = get_poll_quorum_pct(p)
+        req_q = max(1, math.ceil(active_cnt * (quorum_pct / 100.0)))
         tallies = bot.db.calculate_poll_tallies(p["poll_id"])
         icon = "🧊" if p["status"] == "COOLDOWN" else "🗳️"
         shield = " 🛡️" if p["aci_immune"] else ""
