@@ -23,7 +23,7 @@ BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
 
 # Strict single-guild lock: bot automatically leaves any other guild
 ALLOWED_GUILD_ID: int = int(os.getenv("ALLOWED_GUILD_ID", "123456789012345678"))
-GUILD_OBJECT: discord.Object = discord.Object(id=ALLOWED_GUILD_ID)
+GUILD_OBJECT = discord.Object(id=ALLOWED_GUILD_ID)
 
 # Core role IDs
 FULL_MEMBER_ROLE_ID: int = int(os.getenv("FULL_MEMBER_ROLE_ID", "111111111111111111"))
@@ -50,8 +50,8 @@ COMMAND_PERMISSIONS: Dict[str, List[int]] = {
     "sync":            [333333333333333333],
 }
 
-# Core channel IDs
-VOTING_CHANNEL_ID: int = int(os.getenv("VOTING_CHANNEL_ID", "444444444444444444"))
+# Core channel IDs (VOTING_FORUM_ID must be a Discord Forum channel ID)
+VOTING_FORUM_ID: int = int(os.getenv("VOTING_FORUM_ID", "444444444444444444"))
 AUDIT_LOG_CHANNEL_ID: int = int(os.getenv("AUDIT_LOG_CHANNEL_ID", "555555555555555555"))
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
@@ -680,6 +680,13 @@ class HorizonDatabase:
         with self._get_conn() as conn:
             return conn.execute("SELECT * FROM polls WHERE poll_id = ?", (poll_id,)).fetchone()
 
+    def get_poll_by_channel(self, channel_id: int) -> Optional[sqlite3.Row]:
+        with self._get_conn() as conn:
+            return conn.execute(
+                "SELECT * FROM polls WHERE channel_id = ? ORDER BY poll_id DESC LIMIT 1",
+                (channel_id,),
+            ).fetchone()
+
     def get_open_polls(self) -> List[sqlite3.Row]:
         with self._get_conn() as conn:
             return conn.execute(
@@ -862,6 +869,24 @@ def has_command_permission(member: discord.Member, command_key: str) -> bool:
 
 def is_restricted_member(member: discord.Member) -> bool:
     return any(r.id == RESTRICTED_ROLE_ID for r in member.roles)
+
+
+def validate_voting_forum_post(
+    db: HorizonDatabase, interaction: discord.Interaction
+) -> Tuple[bool, str]:
+    ch = interaction.channel
+    if not isinstance(ch, discord.Thread) or ch.parent_id != VOTING_FORUM_ID:
+        return (
+            False,
+            f"🚫 Голосования можно запускать только внутри отдельного поста форума <#{VOTING_FORUM_ID}>.",
+        )
+    existing = db.get_poll_by_channel(ch.id)
+    if existing:
+        return (
+            False,
+            f"🚫 В этом посте уже создано голосование **#{existing['poll_id']}**. Правило: один пост — одно голосование.",
+        )
+    return True, ""
 
 
 def get_guild_activity_stats(
@@ -1546,6 +1571,11 @@ class ElectionQuestionnaireModal(discord.ui.Modal):
             )
             return
 
+        ok_post, post_err = validate_voting_forum_post(self.bot.db, interaction)
+        if not ok_post:
+            await interaction.response.send_message(post_err, ephemeral=True)
+            return
+
         allowed_cd, _, reset_ts = self.bot.db.check_command_rate_limit(
             interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
         )
@@ -1715,11 +1745,21 @@ class HorizonBot(commands.Bot):
         guild = self.get_guild(ALLOWED_GUILD_ID)
         if not guild:
             return
-        channel = guild.get_channel(poll["channel_id"])
-        if not isinstance(channel, discord.TextChannel):
+        channel = guild.get_channel_or_thread(poll["channel_id"])
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(poll["channel_id"])
+            except Exception:
+                return
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
 
         try:
+            if isinstance(channel, discord.Thread) and channel.archived:
+                try:
+                    await channel.edit(archived=False)
+                except Exception:
+                    pass
             msg = await channel.fetch_message(poll["message_id"])
             embed = build_poll_embed(self.db, poll, guild)
             view = PersistentPollView(self, poll)
@@ -1736,7 +1776,7 @@ class HorizonBot(commands.Bot):
         guild = self.get_guild(ALLOWED_GUILD_ID)
         if not guild:
             return
-        channel = guild.get_channel(AUDIT_LOG_CHANNEL_ID) or guild.get_channel(VOTING_CHANNEL_ID)
+        channel = guild.get_channel(AUDIT_LOG_CHANNEL_ID)
         if isinstance(channel, discord.TextChannel):
             embed = discord.Embed(
                 title=title,
@@ -1755,17 +1795,35 @@ class HorizonBot(commands.Bot):
         interaction: discord.Interaction,
         poll_id: int,
         burger_blocks: Optional[List[Tuple[str, str, List[Tuple[str, bytes]]]]] = None,
+        create_forum_post_title: Optional[str] = None,
     ) -> Optional[discord.Message]:
         poll = self.db.get_poll(poll_id)
         guild = self.get_guild(ALLOWED_GUILD_ID) or interaction.guild
         if not poll or not guild:
             return None
 
-        target_channel = guild.get_channel(VOTING_CHANNEL_ID)
-        if not isinstance(target_channel, discord.TextChannel):
-            target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+        if create_forum_post_title:
+            forum = guild.get_channel(VOTING_FORUM_ID)
+            if forum is None:
+                try:
+                    forum = await guild.fetch_channel(VOTING_FORUM_ID)
+                except Exception:
+                    forum = None
+            if not isinstance(forum, discord.ForumChannel):
+                return None
 
-        if not target_channel:
+            embed = build_poll_embed(self.db, poll, guild)
+            view = PersistentPollView(self, poll)
+            created = await forum.create_thread(
+                name=create_forum_post_title[:100],
+                embed=embed,
+                view=view,
+            )
+            self.db.bind_poll_message(poll_id, created.thread.id, created.message.id, burger_links=[])
+            return created.message
+
+        target_channel = interaction.channel
+        if not isinstance(target_channel, discord.Thread) or target_channel.parent_id != VOTING_FORUM_ID:
             return None
 
         burger_jump_urls: List[str] = []
@@ -2228,6 +2286,11 @@ async def cmd_poll_by_id(
         )
         return
 
+    ok_post, post_err = validate_voting_forum_post(bot.db, interaction)
+    if not ok_post:
+        await interaction.response.send_message(post_err, ephemeral=True)
+        return
+
     allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
         interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
     )
@@ -2318,6 +2381,11 @@ async def cmd_poll_impeach(interaction: discord.Interaction, manager: discord.Me
         )
         return
 
+    ok_post, post_err = validate_voting_forum_post(bot.db, interaction)
+    if not ok_post:
+        await interaction.response.send_message(post_err, ephemeral=True)
+        return
+
     allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
         interaction.user.id, "create_poll", 1, POLL_CREATE_COOLDOWN_SECONDS
     )
@@ -2386,6 +2454,11 @@ async def cmd_pollelection(interaction: discord.Interaction, role: discord.Role)
             "🚫 Выдвигаться на должности могут только **Полноценные участники** (п. 1.3).",
             ephemeral=True,
         )
+        return
+
+    ok_post, post_err = validate_voting_forum_post(bot.db, interaction)
+    if not ok_post:
+        await interaction.response.send_message(post_err, ephemeral=True)
         return
 
     allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
@@ -2473,6 +2546,19 @@ async def cmd_public_appeal(interaction: discord.Interaction, justification: str
 
     await interaction.response.defer(ephemeral=True)
 
+    forum = guild.get_channel(VOTING_FORUM_ID)
+    if forum is None:
+        try:
+            forum = await guild.fetch_channel(VOTING_FORUM_ID)
+        except Exception:
+            forum = None
+    if not isinstance(forum, discord.ForumChannel):
+        await interaction.followup.send(
+            "❌ Форум голосований `VOTING_FORUM_ID` не настроен или недоступен.",
+            ephemeral=True,
+        )
+        return
+
     appeal_text = (
         f"[ПУБЛИЧНАЯ АПЕЛЛЯЦИЯ ПО П. 5.1 РЕГЛАМЕНТА]\n"
         f"Апеллянт: {member.display_name} (ID: {member.id})\n"
@@ -2490,11 +2576,15 @@ async def cmd_public_appeal(interaction: discord.Interaction, justification: str
         action_type="LIFT_ISOLATION",
         action_payload={"user_id": member.id},
     )
-    msg = await bot.publish_poll_to_channel(interaction, poll_id)
+    msg = await bot.publish_poll_to_channel(
+        interaction,
+        poll_id,
+        create_forum_post_title=f"Апелляция #{poll_id} — {member.display_name}",
+    )
 
     await interaction.followup.send(
         f"⚖️ Ваша **Публичная апелляция #{poll_id}** (Тир III `[Правосудие]`) опубликована: "
-        f"{msg.jump_url if msg else 'в канале голосований'}.",
+        f"{msg.jump_url if msg else 'на форуме голосований'}.",
         ephemeral=True,
     )
 
@@ -2537,6 +2627,11 @@ async def cmd_poll_action(
             "🚫 Запускать шаблонные голосования могут только **Полноценные участники**.",
             ephemeral=True,
         )
+        return
+
+    ok_post, post_err = validate_voting_forum_post(bot.db, interaction)
+    if not ok_post:
+        await interaction.response.send_message(post_err, ephemeral=True)
         return
 
     allowed_cd, _, reset_ts = bot.db.check_command_rate_limit(
@@ -3348,12 +3443,12 @@ async def cmd_help(interaction: discord.Interaction) -> None:
         "• `🔍 Мой голос` — проверить свой сохранённый голос и лог оценок Управленцев по ACI.\n"
         "• `🚩 Жалоба ACI` — отправить наводку Управленцам на нарушение стандарта ACI.\n"
         "• `⚖️ Панель ACI` — открыть окно валидации ACI.\n\n"
-        "### 📊 Запуск голосований (Разделы 1, 6, 7)\n"
+        f"### 📊 Запуск голосований (в постах форума <#{VOTING_FORUM_ID}>, 1 пост — 1 голосование)\n"
         "• `/poll <category> <message_ids>` — создать голосование по 1 или нескольким ID/ссылкам сообщений («бургер»).\n"
         "• `/poll_impeach <@manager>` — голосование за снятие Управленца в обход ACI с полным иммунитетом (п. 6.8).\n"
         "• `/pollelection <@role>` — заполнить анкету кандидата на должность Управленца (п. 7.1, 7.2).\n"
         "• `/poll_action` — шаблонное голосование с автоисполнением (создание ролей, каналов, прямое избрание по п. 7.1.1).\n"
-        "• `/appeal <justification>` — подать Публичную апелляцию для выхода из Изоляции (п. 5.1).\n"
+        "• `/appeal <justification>` — подать Публичную апелляцию из ЛС бота (создаст пост на форуме, п. 5.1).\n"
         "• `/list` и `/activelist` — список текущих голосований и детальная математика 30-дневного кворума (п. 6.7).\n\n"
         "### 🛡️ Команды Управленцев (по ролям из `COMMAND_PERMISSIONS`)\n"
         "• `/isolate <@member> <reason> [duration]` — перевести в Изоляцию с сохранением ролей и мутом (п. 3.5, лимит 3/24ч).\n"
